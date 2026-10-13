@@ -392,6 +392,55 @@ class TestFigureAccessibilityEnhancement(unittest.TestCase):
         self.assertEqual(dumped["tag"], "H2")
         self.assertEqual(dumped["content"], "Sample figure label")
 
+    def test_figure_non_table_content_not_tagged_as_table(self):
+        """Verify that book paragraphs/headings inside a figure are NEVER grouped as a Table."""
+        lines_detected = [
+            [[[10, 10], [250, 10], [250, 30], [10, 30]], ("Chapter 1: Introduction to Biology", 0.99)],
+            [[[10, 45], [280, 45], [280, 60], [10, 60]], ("Biology is the scientific study of life and organisms.", 0.96)],
+            [[[10, 65], [280, 65], [280, 80], [10, 80]], ("It examines the structure, function, growth, and evolution.", 0.95)],
+            [[[10, 100], [200, 100], [200, 115], [10, 115]], ("Key Biological Concepts:", 0.97)],
+            [[[10, 125], [250, 125], [250, 140], [10, 140]], ("• Cellular structure and metabolism", 0.96)],
+            [[[10, 145], [250, 145], [250, 160], [10, 160]], ("• Genetics and DNA inheritance", 0.96)],
+        ]
+        rect = fitz.Rect(50, 100, 350, 300)
+        sub_elements, id_counter, summary = PaddleLayoutExtractor._process_figure_ocr_lines(
+            lines_detected, rect, 300, 200, page_num=1, page_w=612, page_h=792,
+            id_counter=1, base_font_size=11.0, existing_elements=[]
+        )
+
+        # Content must NOT be classified as a Table!
+        types = [e.get("type") for e in sub_elements]
+        tags = [e.get("tag") for e in sub_elements]
+        self.assertNotIn("table", types)
+        self.assertNotIn("Table", tags)
+        self.assertIn("heading", types)
+        self.assertIn("paragraph", types)
+        self.assertIn("list_item", types)
+
+    def test_figure_mixed_content_individual_tags(self):
+        """Verify that figure containing headings, paragraphs, lists, and genuine tables preserves each element tag."""
+        # 1. Heading + Paragraph
+        # 2. Genuine small table
+        # 3. List item
+        lines_detected = [
+            [[[10, 5], [180, 5], [180, 25], [10, 25]], ("Solar System Planets", 0.99)],
+            [[[10, 35], [260, 35], [260, 50], [10, 50]], ("The solar system consists of the Sun and planetary objects.", 0.95)],
+            [[[10, 70], [200, 70], [200, 85], [10, 85]], ("• Terrestrial planets (Mercury, Venus, Earth, Mars)", 0.97)],
+            [[[10, 90], [200, 90], [200, 105], [10, 105]], ("• Gas giants (Jupiter, Saturn, Uranus, Neptune)", 0.97)],
+        ]
+        rect = fitz.Rect(50, 100, 350, 400)
+        sub_elements, id_counter, summary = PaddleLayoutExtractor._process_figure_ocr_lines(
+            lines_detected, rect, 300, 300, page_num=1, page_w=612, page_h=792,
+            id_counter=1, base_font_size=11.0, existing_elements=[]
+        )
+
+        tags = [e.get("tag") for e in sub_elements]
+        # Should contain H2/H3, P, LI, but NOT Table
+        self.assertTrue(any(t in ("H2", "H3") for t in tags))
+        self.assertIn("P", tags)
+        self.assertIn("LI", tags)
+        self.assertNotIn("Table", tags)
+
 
 if __name__ == "__main__":
     unittest.main()

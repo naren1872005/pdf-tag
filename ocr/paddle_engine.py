@@ -383,9 +383,33 @@ class PaddleLayoutExtractor:
                         round(t_box[2], 2), round(page_h - t_box[1], 2)
                     ]
                     extracted_rows = tab.extract()
-                    # Filter out single-cell or border noise tables
+                    # Filter out noise tables, single-cell boxes, or full-figure text false detections
                     if len(extracted_rows) < 1 or (len(extracted_rows) == 1 and len(extracted_rows[0]) <= 1):
                         continue
+
+                    # Strict Genuine Table Validation:
+                    # A genuine table must have:
+                    # 1. At least 2 rows with non-empty content
+                    # 2. At least 2 columns in multiple rows (grid alignment)
+                    # 3. High data fill ratio (preventing sparse single-column or figure-wide false tables)
+                    rows_with_data = [r for r in extracted_rows if any(c and str(c).strip() for c in r)]
+                    multi_col_rows = [r for r in extracted_rows if len([c for c in r if c and str(c).strip()]) >= 2]
+                    cells_with_data = [c for r in extracted_rows for c in r if c and str(c).strip()]
+                    total_cells = sum(len(r) for r in extracted_rows)
+                    fill_ratio = len(cells_with_data) / max(total_cells, 1)
+
+                    is_genuine_table = (
+                        len(rows_with_data) >= 2 and
+                        len(multi_col_rows) >= 2 and
+                        fill_ratio >= 0.35 and
+                        len(cells_with_data) >= 4
+                    )
+
+                    if not is_genuine_table:
+                        # Do not register as a table; let the text blocks inside be extracted as headings/paragraphs/lists!
+                        continue
+
+                    table_regions.append(t_box)
                     rows_list = []
                     for r_idx, row in enumerate(extracted_rows):
                         cell_type = "table_header_cell" if r_idx == 0 else "table_data_cell"
@@ -816,7 +840,10 @@ class PaddleLayoutExtractor:
         summary = ", ".join(summary_parts)
 
         # 1. Table structure detection inside figure
-        # Sort lines by vertical position (top-down)
+        # A genuine table inside a figure must have:
+        # - At least 2 distinct rows
+        # - Multiple distinct columns aligned horizontally across at least 2 rows
+        # - Short tabular cells rather than continuous prose paragraphs/sentences
         sorted_by_y = sorted(parsed_boxes, key=lambda b: b["top_y"])
         rows = []
         current_row = [sorted_by_y[0]]
@@ -831,7 +858,17 @@ class PaddleLayoutExtractor:
         if current_row:
             rows.append(current_row)
 
-        is_table = len(rows) >= 2 and any(len(row) >= 2 for row in rows) and len(rows) <= 30
+        multi_cell_rows = [r for r in rows if len(r) >= 2]
+        all_cell_texts = [b["text"] for b in parsed_boxes]
+        avg_cell_len = sum(len(t) for t in all_cell_texts) / max(len(all_cell_texts), 1)
+
+        # Genuine table criteria: multiple multi-cell rows, consistent column count, not prose sentences
+        is_table = (
+            len(rows) >= 2 and
+            len(multi_cell_rows) >= 2 and
+            len(rows) <= 30 and
+            avg_cell_len < 45  # Tables have concise cell data, not long book paragraphs
+        )
 
         if is_table:
             table_rows = []
