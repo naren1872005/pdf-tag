@@ -1,0 +1,97 @@
+# ==========================================
+# Byte-compiled / optimized / DLL files
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ==========================================
+# PyInstaller & Build artifacts
+# ==========================================
+build/
+dist/
+dist*/
+dist_*/
+*.spec.bak
+*.manifest
+
+# Inno Setup output & Executables
+*_setup/
+Output/
+*.exe
+*.zip
+!is.exe
+
+# ==========================================
+# Virtual Environments
+# ==========================================
+venv/
+venv_build/
+env/
+.env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==========================================
+# Logs & Diagnostics
+# ==========================================
+Logs/
+logs/
+*.log
+stdout.log
+stderr.log
+build_installer.log
+
+# ==========================================
+# Runtime / Workspace / Local data
+# ==========================================
+workspace/
+app/workspace/
+workspace-old/
+inputs/
+extracted_images/
+app/extracted_images/
+*extracted_images/
+scratch/
+gemini_credential_states.json
+*.json.bak
+visual_objects.json
+visual_report*.json
+mcid_out.txt
+output.txt
+out_ops.txt
+original_content_stream.txt
+
+# ==========================================
+# Secrets & Environment variables
+# ==========================================
+.env
+.env.*
+*.env
+
+# ==========================================
+# Testing & Caches
+# ==========================================
+.pytest_cache/
+.coverage
+htmlcov/
+.cache/
+
+# ==========================================
+# IDE & OS files
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+[Dd]esktop.ini
+.DS_Store
+
+
+Alternative_OCR/
+# Runtime uploads and generated PDF outputs
+workspace_web/

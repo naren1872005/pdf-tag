@@ -1,0 +1,12 @@
+{
+  "paragraph_merge": true,
+  "header_detection": true,
+  "form_detection": true,
+  "save_intermediate": true,
+  "debug_mode": true,
+  "language": "en-US",
+  "pdfua": {
+    "part": 1,
+    "display_doc_title": true
+  }
+}

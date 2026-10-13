@@ -1,0 +1,11 @@
+PySide6
+google-genai
+PyMuPDF
+pikepdf
+pydantic
+Pillow
+python-dotenv
+pyinstaller
+opencv-python
+fonttools
+pywin32

@@ -1,0 +1,11 @@
+{
+    "Checkbox Precision": 0.0,
+    "Checkbox Recall": 0.0,
+    "Underline Precision": 0.0,
+    "Underline Recall": 0.0,
+    "False Positives": 0,
+    "False Negatives": 0,
+    "Gemini Escalation Count": 0,
+    "Average Processing Time": 0.0,
+    "Average Region Confidence": 0.0
+}

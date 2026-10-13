@@ -1,0 +1,18 @@
+checkbox:
+  min_size: 8
+  max_size: 40
+  aspect_ratio:
+    min: 0.85
+    max: 1.15
+underline:
+  min_length: 100
+  close_kernel: 30
+  open_kernel: 100
+  max_gap: 10
+  max_page_width_ratio: 0.8
+table:
+  min_intersections: 4
+  alignment_tolerance: 10
+box:
+  min_width: 30 # points
+  min_height: 15 # points
