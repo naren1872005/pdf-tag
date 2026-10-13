@@ -140,21 +140,29 @@ class StructureEnforcer:
 
     # ------------------------------------------------------------- driver
     def enforce(self, doc_json):
+        enforce_heading_hierarchy(doc_json)
         for page in doc_json.get("pages", []):
             self._collect_ids(page.get("elements", []))
         for page in doc_json.get("pages", []):
             page["elements"] = self._fix_children(None, page.get("elements", []))
+        self._link_multi_page_lists(doc_json)
         return doc_json
 
     def _fix_children(self, parent, kids):
-        kids = [self._fix_node(k) for k in (kids or [])]
+        fixed_kids = []
+        for k in (kids or []):
+            res = self._fix_node(k)
+            if isinstance(res, list):
+                fixed_kids.extend(res)
+            elif res is not None:
+                fixed_kids.append(res)
         ptype = _type(parent) if parent is not None else ""
         # Group orphan list items / TOC entries that are not under their container
         if ptype not in LIST_TYPES:
-            kids = self._group(kids, LI_TYPES | LBL_TYPES | LBODY_TYPES, self._wrap_list, skip_parent=ptype in LI_TYPES)
+            fixed_kids = self._group(fixed_kids, LI_TYPES | LBL_TYPES | LBODY_TYPES, self._wrap_list, skip_parent=ptype in LI_TYPES)
         if ptype not in TOC_TYPES:
-            kids = self._group(kids, TOCI_TYPES, self._wrap_toc, skip_parent=ptype in TOCI_TYPES)
-        return kids
+            fixed_kids = self._group(fixed_kids, TOCI_TYPES, self._wrap_toc, skip_parent=ptype in TOCI_TYPES)
+        return fixed_kids
 
     def _group(self, kids, types, wrapper, skip_parent):
         if skip_parent:
@@ -190,7 +198,8 @@ class StructureEnforcer:
         if pending:
             items.append(self._fix_li(self._make("list_item", pending[0], "LI", kids=pending)))
         self.changes.append(f"wrapped {len(items)} list item(s) in L")
-        return self._make("list", run[0], "L", kids=items)
+        root_l = self._make("list", run[0], "L", kids=[])
+        return self._build_list_tree(root_l, items)
 
     def _wrap_toc(self, run):
         self.changes.append(f"wrapped {len(run)} TOC entr(ies) in TOC")
@@ -226,20 +235,173 @@ class StructureEnforcer:
             el["kids"] = self._fix_children(el, el["kids"])
         return el
 
+    def _analyze_item(self, item):
+        label_txt = ""
+        for k in item.get("kids") or []:
+            if _type(k) in LBL_TYPES:
+                label_txt = (k.get("content") or "").strip()
+                break
+        if not label_txt:
+            label_txt = (item.get("list_label") or "").strip()
+        if not label_txt:
+            m, _ = split_marker(item.get("content") or "")
+            label_txt = m.strip()
+
+        m_type = "unknown"
+        num_val = None
+
+        if label_txt:
+            if any(c in BULLET_CHARS for c in label_txt) or label_txt in BULLET_CHARS:
+                m_type = "bullet"
+            else:
+                m_num = re.match(r'^[\[\(]?(\d+)[\]\)\.:]?$', label_txt)
+                if m_num:
+                    m_type = "numeric"
+                    num_val = int(m_num.group(1))
+                else:
+                    m_alpha = re.match(r'^[\[\(]?([a-zA-Z])[\]\)\.:]?$', label_txt)
+                    if m_alpha:
+                        char = m_alpha.group(1)
+                        if len(char) == 1:
+                            m_type = "alpha_lower" if char.islower() else "alpha_upper"
+                            num_val = ord(char.lower()) - ord('a') + 1
+
+        bbox = item.get("bounding_box") or []
+        x0 = bbox[0] if isinstance(bbox, (list, tuple)) and len(bbox) >= 1 else 0.0
+        return label_txt, m_type, num_val, x0
+
+    def _build_list_tree(self, root_list, raw_items):
+        if not raw_items:
+            root_list["kids"] = []
+            return root_list
+
+        first_li = next((i for i in raw_items if _type(i) in LI_TYPES), raw_items[0])
+        first_lbl, first_mtype, first_num, first_x0 = self._analyze_item(first_li)
+        root_list["kids"] = []
+
+        stack = [{
+            "level": 0,
+            "list_node": root_list,
+            "last_li": None,
+            "marker_type": first_mtype,
+            "last_num": first_num,
+            "x0": first_x0
+        }]
+
+        for item in raw_items:
+            t = _type(item)
+            if t in LIST_TYPES:
+                curr_li = stack[-1]["last_li"]
+                if curr_li is not None:
+                    self._body_of(curr_li)["kids"].append(item)
+                    self._refresh_bbox(self._body_of(curr_li))
+                else:
+                    stack[-1]["list_node"]["kids"].append(item)
+                continue
+
+            if t not in LI_TYPES:
+                curr_li = stack[-1]["last_li"]
+                if curr_li is not None:
+                    self._body_of(curr_li)["kids"].append(item)
+                else:
+                    stack[-1]["list_node"]["kids"].append(item)
+                continue
+
+            li = self._fix_li(item)
+            lbl, m_type, num_val, x0 = self._analyze_item(li)
+
+            top = stack[-1]
+
+            # 1. Ancestor resumption check (pop)
+            resumed_idx = None
+            if len(stack) > 1:
+                for idx in range(len(stack) - 2, -1, -1):
+                    anc = stack[idx]
+                    # Numeric sequence continuation (e.g. 3 -> 4)
+                    if m_type == "numeric" and anc["marker_type"] == "numeric":
+                        if anc["last_num"] is not None and num_val is not None:
+                            if num_val == anc["last_num"] + 1 or (num_val > anc["last_num"] and num_val <= anc["last_num"] + 3):
+                                resumed_idx = idx
+                                break
+                    # Alpha sequence continuation (e.g. a -> b)
+                    if m_type in ("alpha_lower", "alpha_upper") and anc["marker_type"] == m_type:
+                        if anc["last_num"] is not None and num_val is not None and num_val == anc["last_num"] + 1:
+                            resumed_idx = idx
+                            break
+                    # Visual unindentation back to ancestor's column position
+                    if abs(x0 - anc["x0"]) <= 6.0 and m_type == anc["marker_type"] and x0 < top["x0"] - 4.0:
+                        resumed_idx = idx
+                        break
+
+            if resumed_idx is not None:
+                while len(stack) > resumed_idx + 1:
+                    popped = stack.pop()
+                    self._refresh_bbox(popped["list_node"])
+                top = stack[-1]
+
+            # 2. Nested child level check (push)
+            is_nested = False
+            if top["last_li"] is not None:
+                ordered_to_unordered = (top["marker_type"] == "numeric" and m_type == "bullet")
+                submarker = (m_type in ("alpha_lower", "roman") and top["marker_type"] not in ("alpha_lower", "roman"))
+                indented = (x0 >= top["x0"] + 6.0 and abs(x0 - top["x0"]) < 100.0)
+                restarted_num = (m_type == "numeric" and num_val == 1 and (top["last_num"] or 0) >= 1 and indented)
+
+                if ordered_to_unordered or submarker or indented or restarted_num:
+                    is_nested = True
+
+            if is_nested:
+                parent_li = top["last_li"]
+                parent_body = self._body_of(parent_li)
+                sub_l = self._make("list", li, "L", kids=[])
+                parent_body["kids"].append(sub_l)
+                self.changes.append("nested L created inside parent LBody")
+
+                new_level = {
+                    "level": len(stack),
+                    "list_node": sub_l,
+                    "last_li": li,
+                    "marker_type": m_type,
+                    "last_num": num_val,
+                    "x0": x0
+                }
+                stack.append(new_level)
+                sub_l["kids"].append(li)
+            else:
+                top["list_node"]["kids"].append(li)
+                top["last_li"] = li
+                if num_val is not None:
+                    top["last_num"] = num_val
+                if m_type != "unknown":
+                    top["marker_type"] = m_type
+
+        while len(stack) > 1:
+            popped = stack.pop()
+            self._refresh_bbox(popped["list_node"])
+        self._refresh_bbox(root_list)
+        return root_list
+
     def _fix_list(self, L):
+        raw_kids = L.get("kids") or []
         items = []
-        for k in L.get("kids") or []:
+        trailing_non_list = []
+
+        # Separate trailing non-list elements (e.g. content following the list)
+        end_idx = len(raw_kids)
+        while end_idx > 0:
+            last_k = raw_kids[end_idx - 1]
+            last_t = _type(last_k)
+            if last_t in (LI_TYPES | LBL_TYPES | LBODY_TYPES | LIST_TYPES):
+                break
+            trailing_non_list.insert(0, last_k)
+            end_idx -= 1
+
+        for k in raw_kids[:end_idx]:
             t = _type(k)
             if t in LI_TYPES:
                 items.append(k)
             elif t in LIST_TYPES:
-                # L directly in L -> nested list belongs to the previous item's LBody
-                if items:
-                    self._body_of(items[-1])["kids"].append(k)
-                    self._refresh_bbox(self._body_of(items[-1]))
-                else:
-                    items.append(self._fix_li(self._make("list_item", k, "LI", kids=[k])))
-                self.changes.append("moved nested L from L into LI/LBody")
+                items.append(k)
             elif t in LBL_TYPES or t in LBODY_TYPES:
                 if t in LBODY_TYPES and items and not self._has_body_content(items[-1]) and not self._label_of(items[-1]):
                     items[-1]["kids"].append(k)
@@ -254,9 +416,12 @@ class StructureEnforcer:
                     self._body_of(items[-1])["kids"].append(k)
                 else:
                     items.append(self._fix_li(self._make("list_item", k, "LI", kids=[k])))
-        L["kids"] = items
+
+        L = self._build_list_tree(L, items)
         L.pop("content", None)
         self._refresh_bbox(L)
+        if trailing_non_list:
+            return [L] + trailing_non_list
         return L
 
     def _label_of(self, li):
@@ -599,6 +764,124 @@ class StructureEnforcer:
         if u:
             el["bounding_box"] = u
 
+    # ------------------------------------------------------------- multi-page lists
+    def _is_footer_or_page_number(self, el):
+        txt = (el.get("content") or "").strip()
+        if re.match(r'^[A-Za-z]?\d{1,5}$', txt):
+            return True
+        if re.match(r'^(?:Page\s+\d+|Unit\s+\d+|\d+\s+Unit).*', txt, re.IGNORECASE):
+            return True
+        b = el.get("bounding_box") or []
+        if len(b) == 4 and b[3] <= 45:
+            return True
+        return False
+
+    def _is_header_or_page_number(self, el):
+        txt = (el.get("content") or "").strip()
+        if re.match(r'^[A-Za-z]?\d{1,5}$', txt):
+            return True
+        if re.match(r'^(?:Chapter\s+\d+|Unit\s+\d+).*', txt, re.IGNORECASE) and len(txt) < 30:
+            return True
+        return False
+
+    def _get_first_li(self, list_node):
+        for k in list_node.get("kids") or []:
+            if _type(k) in LI_TYPES:
+                return k
+        return None
+
+    def _get_last_deep_li(self, list_node):
+        for k in reversed(list_node.get("kids") or []):
+            if _type(k) in LI_TYPES:
+                body = self._body_of(k)
+                nested_ls = [child for child in (body.get("kids") or []) if _type(child) in LIST_TYPES]
+                if nested_ls:
+                    deep, _ = self._get_last_deep_li(nested_ls[-1])
+                    if deep:
+                        return deep, k
+                return k, None
+        return None, None
+
+    def _should_continue_list(self, last_list, first_list):
+        last_deep_li, last_parent_li = self._get_last_deep_li(last_list)
+        first_li = self._get_first_li(first_list)
+        if not last_deep_li or not first_li:
+            return False
+
+        _, last_mtype, last_num, _ = self._analyze_item(last_deep_li)
+        first_lbl, first_mtype, first_num, _ = self._analyze_item(first_li)
+
+        # 1. Direct sequential numeric continuation (e.g. 3 -> 4)
+        if last_mtype == "numeric" and first_mtype == "numeric":
+            if last_num is not None and first_num is not None and first_num == last_num + 1:
+                return True
+
+        # 2. Resuming parent numeric sequence after nested list
+        if last_parent_li is not None and first_mtype == "numeric":
+            _, parent_mtype, parent_num, _ = self._analyze_item(last_parent_li)
+            if parent_mtype == "numeric" and parent_num is not None and first_num is not None and first_num == parent_num + 1:
+                return True
+
+        # 3. Alpha sequence continuation (e.g. b -> c)
+        if last_mtype in ("alpha_lower", "alpha_upper") and first_mtype == last_mtype:
+            if last_num is not None and first_num is not None and first_num == last_num + 1:
+                return True
+
+        # 4. Continuing active nested bullet list across pages
+        if last_parent_li is not None and last_mtype == "bullet" and first_mtype == "bullet":
+            return True
+
+        # 5. Continuing flat bullet list across pages (matching bullet character)
+        if last_mtype == "bullet" and first_mtype == "bullet":
+            last_lbl, _, _, _ = self._analyze_item(last_deep_li)
+            if last_lbl and first_lbl and last_lbl == first_lbl:
+                return True
+
+        return False
+
+    def _link_multi_page_lists(self, doc_json):
+        pages = doc_json.get("pages", [])
+        if len(pages) < 2:
+            return
+
+        for p_idx in range(len(pages) - 1):
+            curr_p = pages[p_idx]
+            next_p = pages[p_idx + 1]
+
+            curr_els = curr_p.get("elements", [])
+            next_els = next_p.get("elements", [])
+            if not curr_els or not next_els:
+                continue
+
+            last_list = None
+            for el in reversed(curr_els):
+                if self._is_footer_or_page_number(el):
+                    continue
+                if _type(el) in LIST_TYPES:
+                    last_list = el
+                break
+
+            if last_list is None:
+                continue
+
+            first_list = None
+            for el in next_els:
+                if self._is_header_or_page_number(el):
+                    continue
+                if _type(el) in LIST_TYPES:
+                    first_list = el
+                break
+
+            if first_list is None:
+                continue
+
+            if self._should_continue_list(last_list, first_list):
+                first_list["continues_list_id"] = str(last_list.get("id"))
+                first_list["is_continuation"] = True
+                self.changes.append(
+                    f"linked continuing list on page {next_p.get('page_number')} to list {last_list.get('id')} on page {curr_p.get('page_number')}"
+                )
+
 
 # ---------------------------------------------------------------------------
 # TOC link targets
@@ -855,6 +1138,74 @@ def _set_heading_level(el, level):
     else:
         el["type"] = f"H{level}"
         el["tag"] = f"H{level}"
+
+
+OUTLINE_HEADING_RE = re.compile(
+    r'^\s*(?:(?:chapter|section)\s+)?(\d+(?:\.\d+)*)\.?\s*(\S.*)?$',
+    re.IGNORECASE
+)
+
+
+def enforce_heading_hierarchy(doc_json):
+    """
+    Enforces hierarchical heading structure based on outline numbering and strict single-H1 rule:
+      - 2 (or top-level section / title) -> H1 (strict single-H1 rule: only once in PDF)
+      - 2.1, 2.2, 2.3 -> H2 (subsections)
+      - 2.2.1, 2.3.1 -> H3 (sub-subsections)
+      - 2.2.1.2, 2.3.1.2 -> H4 (sub-sub-subsections)
+    
+    Font formatting invariance rule:
+      Heading levels are determined by the semantic outline hierarchy,
+      independent of font family, font size, or bold styling ("same font, size, bold").
+    """
+    ordered = []
+
+    def walk(els, inside):
+        for el in els or []:
+            if not isinstance(el, dict):
+                continue
+            ordered.append((el, inside))
+            walk(el.get("kids"), inside or _type(el) in _NO_TITLE_INSIDE)
+
+    for page in sorted(doc_json.get("pages", []), key=lambda p: p.get("page_number") or 0):
+        walk(page.get("elements"), False)
+
+    first_h1_found = False
+    for el, inside in ordered:
+        if inside:
+            continue
+        if _heading_level(el) == 1:
+            first_h1_found = True
+            break
+
+    for el, inside in ordered:
+        if inside or _type(el) in LI_TYPES or _type(el) in _NO_TITLE_INSIDE:
+            continue
+        txt = (el.get("content") or el.get("text") or "").strip()
+        m = OUTLINE_HEADING_RE.match(txt)
+        if m:
+            num_str = m.group(1)
+            parts = num_str.split('.')
+
+            if len(parts) >= 2:
+                # Multi-level numbered section heading (2.1, 2.2, 2.2.1, 2.2.1.2, etc.)
+                # Applies regardless of font size or weight ("same font, size, bold")
+                if len(txt) <= 120 or _type(el) == "heading":
+                    lvl = min(6, len(parts))
+                    el["type"] = "heading"
+                    _set_heading_level(el, lvl)
+                    el.pop("list_level", None)
+                    el.pop("list_label", None)
+            elif len(parts) == 1:
+                # Single-number section e.g. "2." or "2. Main Chapter" or "Chapter 2"
+                is_hdr = _type(el) == "heading" or (len(txt) <= 80 and not txt.endswith('.'))
+                if is_hdr:
+                    el["type"] = "heading"
+                    if not first_h1_found:
+                        _set_heading_level(el, 1)
+                        first_h1_found = True
+                    else:
+                        _set_heading_level(el, 2)
 
 
 def ensure_h1(doc_json):

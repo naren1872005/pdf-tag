@@ -19,8 +19,15 @@ class HeadingHierarchyRule(BaseSemanticRule):
         for node in ordered_nodes:
             sem_type = node.semantic.get("type", "")
             if sem_type == "heading":
-                # Assuming level is stored in node.semantic["heading_level"]
-                level = node.semantic.get("heading_level", 1)
+                import re
+                c_text = str(getattr(node, "text", "") or node.semantic.get("content", "")).strip()
+                m_sec = re.match(r'^\s*(?:(?:chapter|section)\s+)?(\d+(?:\.\d+)+)\.?\s*(\S.*)?$', c_text, re.IGNORECASE)
+                if m_sec:
+                    parts = m_sec.group(1).split('.')
+                    level = min(6, len(parts))
+                    node.semantic["heading_level"] = level
+                else:
+                    level = node.semantic.get("heading_level", 1)
                 
                 # Check 0: The first heading in the document MUST be H1
                 if current_level == 0 and level != 1:

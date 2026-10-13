@@ -196,7 +196,14 @@ class PaddleLayoutExtractor:
                     classified_elements = []
                     for k in text_kids:
                         txt = (k.get('content') or '').strip()
-                        if re.match(r'^([•●○▪■□►▸\-\*]|\d+[\.\)]|[a-zA-Z][\.\)])\s+', txt):
+                        m_sec = re.match(r'^\s*(?:(?:Chapter|Section)\s+)?(\d+(?:\.\d+)*)\.?\s*(\S.*)?$', txt, re.IGNORECASE)
+                        if m_sec and len(m_sec.group(1).split('.')) >= 2:
+                            parts = m_sec.group(1).split('.')
+                            h_lv = min(6, len(parts))
+                            k['type'] = 'heading'
+                            k['tag'] = f'H{h_lv}'
+                            k['heading_level'] = h_lv
+                        elif re.match(r'^([•●○▪■□►▸\-\*]|\d+[\.\)]|[a-zA-Z][\.\)])\s+', txt):
                             k['type'] = 'list_item'
                             k['tag'] = 'LI'
                         elif len(txt) < 80 and not txt.endswith('.') and (txt.isupper() or len(txt.split()) <= 6):
@@ -493,19 +500,82 @@ class PaddleLayoutExtractor:
                         round(l_box[2], 2), round(page_h - l_box[1], 2)
                     ]
 
+                    # Check for hierarchical outline section numbering:
+                    # e.g., "2", "2.", "2.1", "2.2", "2.2.1", "2.2.1.2", "2.3.1.2"
+                    # Rule: Heading levels follow document outline rather than visual appearance ("same font, size, bold").
+                    outline_match = re.match(r'^\s*(?:(?:Chapter|Section)\s+)?(\d+(?:\.\d+)*)\.?\s*(\S.*)?$', line_text, re.IGNORECASE)
+                    is_outline_heading = False
+                    outline_h_level = None
+
+                    if outline_match:
+                        num_str = outline_match.group(1)
+                        parts = num_str.split('.')
+                        title_part = (outline_match.group(2) or "").strip()
+
+                        if len(parts) >= 2:
+                            # Multi-level numbered section heading (2.1, 2.2, 2.2.1, 2.2.1.2, etc.)
+                            # Even with same font family, font size, and bold formatting ("same font, size, bold"):
+                            # Heading level is strictly determined by outline depth:
+                            # 2 parts (2.1, 2.2, 2.3) -> H2
+                            # 3 parts (2.2.1, 2.3.1) -> H3
+                            # 4 parts (2.2.1.2, 2.3.1.2) -> H4
+                            if len(line_text) < 120 and (has_bold or not title_part.endswith('.') or max_s >= base_font_size * 1.0):
+                                is_outline_heading = True
+                                outline_h_level = min(6, len(parts))
+                        elif len(parts) == 1:
+                            # Single-number top-level section (e.g. "2." or "2. Introduction" or "Chapter 2")
+                            # A multi-word sentence / instruction (e.g. "1. Direct students' attention...") is a list item, not a section heading.
+                            has_ch_prefix = bool(re.match(r'^\s*(?:Chapter|Section)\s+', line_text, re.IGNORECASE))
+                            title_words = title_part.split()
+                            is_short_title = bool(title_part) and len(title_words) <= 5 and len(line_text) < 45 and not title_part.endswith('.') and not any(p in title_part for p in (',', ';', ':', '?', '!'))
+                            is_title_candidate = (
+                                has_ch_prefix or
+                                (line_text.isupper() and len(line_text) < 35 and any(c.isalpha() for c in line_text)) or
+                                (is_short_title and (has_bold or max_s >= base_font_size * 1.15)) or
+                                (not bool(title_part) and len(line_text) < 10 and max_s >= base_font_size * 1.15)
+                            )
+                            if is_title_candidate:
+                                is_outline_heading = True
+                                # Rule: "2. H1 -> only once in pdf"
+                                if not has_seen_h1:
+                                    outline_h_level = 1
+                                    has_seen_h1 = True
+                                else:
+                                    outline_h_level = 2
+
                     # Normalize bullet markers (convert literal "Bullet " text to bullet symbol)
                     norm_text = re.sub(r'^\s*Bullet\s+', '• ', line_text)
-                    is_bullet = bool(re.match(r'^(•|[•●○▪■□►▸\-\*]|\d+[\.\)]|[a-zA-Z][\.\)])\s+', norm_text))
+                    is_bullet = False
+                    if not is_outline_heading:
+                        is_bullet = bool(re.match(r'^(•|[•●○▪■□►▸\-\*]|\d+[\.\)]|[a-zA-Z][\.\)])\s+', norm_text))
 
-                    # Heading classification based on typography hierarchy
-                    is_h1 = (max_s >= base_font_size * 1.8) and (len(line_text) < 90)
+                    # Heading classification based on typography hierarchy (for non-numbered headings)
+                    is_h1 = (max_s >= base_font_size * 1.8) and (len(line_text) < 90) and (not has_seen_h1)
                     is_h2 = (max_s >= base_font_size * 1.25) and (len(line_text) < 90) and not line_text.endswith('.')
+                    is_page_number = bool(re.match(r'^[A-Za-z]?\d{1,5}$', line_text.strip()))
                     is_h3 = (
-                        (has_bold and max_s >= base_font_size * 1.05 and len(line_text) < 65 and not line_text.endswith('.')) or
-                        (line_text.isupper() and len(line_text) < 30 and not line_text.endswith('.'))
+                        not is_page_number and (
+                            (has_bold and max_s >= base_font_size * 1.05 and len(line_text) < 65 and not line_text.endswith('.')) or
+                            (line_text.isupper() and len(line_text) < 30 and not line_text.endswith('.') and any(c.isalpha() for c in line_text))
+                        )
                     )
 
-                    if is_bullet:
+                    if is_outline_heading:
+                        if curr_el:
+                            elements.append(curr_el)
+                        curr_el = {
+                            "id": id_counter,
+                            "type": "heading",
+                            "tag": f"H{outline_h_level}",
+                            "heading_level": outline_h_level,
+                            "content": line_text,
+                            "bounding_box": pdf_bbox,
+                            "font_size": round(max_s, 1),
+                            "confidence": 1.0
+                        }
+                        id_counter += 1
+
+                    elif is_bullet:
                         if curr_el:
                             elements.append(curr_el)
                         curr_el = {
@@ -1231,11 +1301,38 @@ class PaddleLayoutExtractor:
             bbox = item["bbox"]
             conf = item["confidence"]
 
-            is_bullet = bool(re.match(r"^([•\-\*\u2022\u25cf\u25cb]|\d+[\.\)]|[a-zA-Z][\.\)]|\([a-zA-Z0-9]\))\s+", txt))
+            m_sec = re.match(r'^\s*(?:(?:Chapter|Section)\s+)?(\d+(?:\.\d+)*)\.?\s*(\S.*)?$', txt, re.IGNORECASE)
+            is_outline_heading = False
+            outline_lvl = 2
+            if m_sec:
+                parts = m_sec.group(1).split('.')
+                if len(parts) >= 2 and len(txt) < 120:
+                    is_outline_heading = True
+                    outline_lvl = min(6, len(parts))
+
+            is_bullet = False
+            if not is_outline_heading:
+                is_bullet = bool(re.match(r"^([•\-\*\u2022\u25cf\u25cb]|\d+[\.\)]|[a-zA-Z][\.\)]|\([a-zA-Z0-9]\))\s+", txt))
             is_formula = bool(re.search(r'([=≈≠≤≥∑√∫±]|\b[a-zA-Z]\s*=\s*|\b\d+\s*[\+\-\*\/]\s*\d+)', txt)) and len(txt) < 40
             is_heading = (h >= median_h * 1.3 or (txt.isupper() and len(txt) < 40)) and len(txt) < 90 and not txt.endswith('.')
 
-            if is_bullet:
+            if is_outline_heading:
+                if curr_p:
+                    sub_elements.append(curr_p)
+                    curr_p = None
+                el = {
+                    "id": id_counter,
+                    "type": "heading",
+                    "tag": f"H{outline_lvl}",
+                    "heading_level": outline_lvl,
+                    "content": txt,
+                    "bounding_box": bbox,
+                    "confidence": conf
+                }
+                id_counter += 1
+                sub_elements.append(el)
+
+            elif is_bullet:
                 if curr_p:
                     sub_elements.append(curr_p)
                     curr_p = None
@@ -1354,20 +1451,44 @@ class PaddleLayoutExtractor:
         right_narrow = [el for el in digital_elements if el.get("bounding_box", [0, 0, 0, 0])[0] >= col_split and (el.get("bounding_box", [0, 0, 0, 0])[2] - el.get("bounding_box", [0, 0, 0, 0])[0]) < page_w * 0.45]
         is_multi_col = (page_w > 400 and len(left_narrow) >= 2 and len(right_narrow) >= 2)
 
+        bot_footers = []
+        top_headers = []
+        body_elements = []
+
+        if is_multi_col:
+            for el in digital_elements:
+                b = el.get("bounding_box", [0, 0, 0, 0])
+                top_y = get_top(el)
+                # Bottom margin in PDF coordinates: y1 <= 45 or top_y >= page_h - 45
+                if len(b) == 4 and (b[3] <= 45 or top_y >= page_h - 45):
+                    bot_footers.append(el)
+                elif len(b) == 4 and top_y <= 40 and (b[2] - b[0]) >= page_w * 0.45:
+                    top_headers.append(el)
+                else:
+                    body_elements.append(el)
+            bot_footers.sort(key=lambda e: e.get("bounding_box", [0, 0, 0, 0])[0])
+            top_headers.sort(key=lambda e: e.get("bounding_box", [0, 0, 0, 0])[0])
+        else:
+            body_elements = digital_elements
+
         if not figures_data:
-            def sort_key(el):
-                bbox = el.get("bounding_box", [0, 0, 0, 0])
-                top = page_h - bbox[3] if len(bbox) == 4 else 0
-                left = bbox[0] if len(bbox) == 4 else 0
-                col = 1 if (is_multi_col and left >= col_split) else 0
-                return (col, round(top / 8) * 8, left)
-            sorted_els = sorted(digital_elements, key=sort_key)
+            if is_multi_col:
+                col0 = sorted([e for e in body_elements if e.get("bounding_box", [0,0,0,0])[0] < col_split], key=get_top)
+                col1 = sorted([e for e in body_elements if e.get("bounding_box", [0,0,0,0])[0] >= col_split], key=get_top)
+                sorted_els = top_headers + col0 + col1 + bot_footers
+            else:
+                def sort_key(el):
+                    bbox = el.get("bounding_box", [0, 0, 0, 0])
+                    top = page_h - bbox[3] if len(bbox) == 4 else 0
+                    left = bbox[0] if len(bbox) == 4 else 0
+                    return (round(top / 8) * 8, left)
+                sorted_els = sorted(digital_elements, key=sort_key)
             for idx, el in enumerate(sorted_els):
                 el["reading_order"] = idx + 1
             return sorted_els
 
-        col0_els = sorted([el for el in digital_elements if el.get("bounding_box", [0,0,0,0])[0] < col_split] if is_multi_col else digital_elements, key=get_top)
-        col1_els = sorted([el for el in digital_elements if el.get("bounding_box", [0,0,0,0])[0] >= col_split], key=get_top) if is_multi_col else []
+        col0_els = sorted([el for el in body_elements if el.get("bounding_box", [0,0,0,0])[0] < col_split] if is_multi_col else body_elements, key=get_top)
+        col1_els = sorted([el for el in body_elements if el.get("bounding_box", [0,0,0,0])[0] >= col_split], key=get_top) if is_multi_col else []
 
         col0_figs = []
         col1_figs = []
@@ -1413,6 +1534,7 @@ class PaddleLayoutExtractor:
 
         combined = []
         if is_multi_col:
+            combined.extend(top_headers)
             top_spanning = [f for f in spanning_figs if f["top_y"] < (page_h * 0.25)]
             mid_spanning = [f for f in spanning_figs if (page_h * 0.25) <= f["top_y"] <= (page_h * 0.75)]
             bot_spanning = [f for f in spanning_figs if f["top_y"] > (page_h * 0.75)]
@@ -1425,6 +1547,7 @@ class PaddleLayoutExtractor:
             combined.extend(final_col1)
             for f in bot_spanning:
                 combined.extend([f["figure_el"]] + f["extracted_elements"])
+            combined.extend(bot_footers)
         else:
             combined = final_col0
             for f in spanning_figs:

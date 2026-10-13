@@ -32,10 +32,10 @@ class HeadingCandidateValidator(BasePlugin):
             form_density = self._calculate_page_form_density(page_elements)
             
             # Identify all headings on this page for context
-            page_headings = [e for e in page_elements if e.get("type") or e.get("semantic", {}).get("type") == "heading"]
+            page_headings = [e for e in page_elements if (e.get("type") == "heading" or e.get("semantic", {}).get("type") == "heading")]
             
             for i, el in enumerate(page_elements):
-                if el.get("type") or el.get("semantic", {}).get("type") == "heading":
+                if el.get("type") == "heading" or el.get("semantic", {}).get("type") == "heading":
                     self._validate_candidate(
                         el, i, page_elements, form_density, median_area, len(page_headings)
                     )
@@ -44,7 +44,7 @@ class HeadingCandidateValidator(BasePlugin):
         areas = []
         for page in raw_data.get("pages", []):
             for el in page.get("elements", []):
-                if el.get("type") or el.get("semantic", {}).get("type") == "heading":
+                if el.get("type") == "heading" or el.get("semantic", {}).get("type") == "heading":
                     bbox = el.get("bounding_box") or el.get("geometry", {}).get("bbox")
                     if bbox and len(bbox) == 4:
                         area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
@@ -58,7 +58,7 @@ class HeadingCandidateValidator(BasePlugin):
         if not elements:
             return 0.0
         
-        form_related_count = sum(1 for e in elements if e.get("type") or e.get("semantic", {}).get("type") in self.FORM_RELATED_TYPES)
+        form_related_count = sum(1 for e in elements if (e.get("type") in self.FORM_RELATED_TYPES or e.get("semantic", {}).get("type") in self.FORM_RELATED_TYPES))
         return form_related_count / len(elements)
         
     def _get_neighbors(self, index: int, elements: List[Dict[str, Any]], window: int = 3) -> List[Dict[str, Any]]:
@@ -85,6 +85,11 @@ class HeadingCandidateValidator(BasePlugin):
         content = (el.get("content") or el.get("text") or "").strip()
         level = el.get("heading_level") or el.get("semantic", {}).get("heading_level")
         bbox = el.get("bounding_box") or el.get("geometry", {}).get("bbox")
+
+        # Outline section headings (e.g. 2.1, 2.2, 2.2.1, 2.2.1.2) are always structural document headings
+        import re
+        if re.match(r'^\s*(?:(?:chapter|section)\s+)?\d+(?:\.\d+)+\.?\s*(\S.*)?$', content, re.IGNORECASE):
+            return
         
         # Signal A: Form Context
         if form_density >= self.FORM_DENSITY_THRESHOLD:

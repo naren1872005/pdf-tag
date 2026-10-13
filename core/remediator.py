@@ -8,7 +8,7 @@ from ocr.paddle_engine import PaddleLayoutExtractor
 from export.semantic_validator import SemanticValidator
 from export.semantic_normalizer import SemanticNormalizer
 from export.accessibility_mapper import AccessibilityMapper
-from export.structure_enforcer import StructureEnforcer, attach_toc_targets, ensure_h1
+from export.structure_enforcer import StructureEnforcer, attach_toc_targets, ensure_h1, enforce_heading_hierarchy
 from renderer.page_renderer import PageRenderer
 from renderer.struct_tree_builder import StructTreeBuilder, finalize_element_ids
 from renderer.parent_tree_builder import ParentTreeBuilder
@@ -161,9 +161,10 @@ class TaggingService:
         normalizer = SemanticNormalizer()
         doc_json = normalizer.normalize(doc_json)
 
-        # 3. Structure Enforcement (H1 check, List nesting, Table integrity)
+        # 3. Structure Enforcement (H1 check, List nesting, Table integrity, Heading hierarchy)
         enforcer = StructureEnforcer()
         doc_json = enforcer.enforce(doc_json)
+        enforce_heading_hierarchy(doc_json)
         ensure_h1(doc_json)
         attach_toc_targets(doc_json)
 

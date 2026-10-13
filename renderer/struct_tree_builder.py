@@ -363,7 +363,7 @@ class StructTreeBuilder:
         # Check if we are already inside a list to prevent infinite recursion
         in_list = False
         if parent_elem is not None and hasattr(parent_elem, 'keys') and "/S" in parent_elem:
-            if str(parent_elem.get("/S")) == "/L":
+            if str(parent_elem.get("/S")) in ("/L", "/LBody"):
                 in_list = True
                 
         while i < len(elements):
@@ -736,8 +736,48 @@ class StructTreeBuilder:
                         parent_elem.K = Array()
                     parent_elem.K.append(elem_dict)
                     elem_dict.P = parent_elem
+            elif tag == "L" and str(parent_elem.get("/S", "")) in ("/Document", "/Part", "/Art", "/Sect"):
+                # Multi-Page List Continuation:
+                # Do not generate a disconnected new <L> root; link continuing <LI> items
+                # directly under the existing primary <L> tree structure.
+                target_l_id = str(el.get("continues_list_id") or "")
+                existing_root_l = None
+                if target_l_id and hasattr(pdf, "_list_struct_map"):
+                    existing_root_l = pdf._list_struct_map.get(target_l_id)
+                if existing_root_l is None and el.get("is_continuation") and "/K" in parent_elem:
+                    for k_child in parent_elem.K:
+                        if isinstance(k_child, Dictionary) and str(k_child.get("/S", "")) == "/L":
+                            existing_root_l = k_child
+                            break
+
+                if existing_root_l is not None:
+                    # Move all children of the newly built continuing L element into existing_root_l
+                    if "/K" in elem_dict:
+                        if "/K" not in existing_root_l:
+                            existing_root_l.K = Array()
+                        for li_child in elem_dict.K:
+                            if isinstance(li_child, Dictionary):
+                                li_child.P = existing_root_l
+                            existing_root_l.K.append(li_child)
+                    if el_id is not None:
+                        if not hasattr(pdf, "_list_struct_map"):
+                            pdf._list_struct_map = {}
+                        pdf._list_struct_map[str(el_id)] = existing_root_l
+                else:
+                    if "/K" not in parent_elem:
+                        parent_elem.K = Array()
+                    parent_elem.K.append(elem_dict)
+                    elem_dict.P = parent_elem
+                    if el_id is not None:
+                        if not hasattr(pdf, "_list_struct_map"):
+                            pdf._list_struct_map = {}
+                        pdf._list_struct_map[str(el_id)] = elem_dict
             else:
                 if "/K" not in parent_elem:
                     parent_elem.K = Array()
                 parent_elem.K.append(elem_dict)
                 elem_dict.P = parent_elem
+                if tag == "L" and el_id is not None:
+                    if not hasattr(pdf, "_list_struct_map"):
+                        pdf._list_struct_map = {}
+                    pdf._list_struct_map[str(el_id)] = elem_dict
