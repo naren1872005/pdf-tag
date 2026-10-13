@@ -441,6 +441,98 @@ class TestFigureAccessibilityEnhancement(unittest.TestCase):
         self.assertIn("LI", tags)
         self.assertNotIn("Table", tags)
 
+    def test_raster_figure_table_alongside_prose(self):
+        """Verify that a raster figure containing a genuine table alongside prose classifies both correctly."""
+        lines_detected = [
+            [[[10, 5], [200, 5], [200, 20], [10, 20]], ("Summary of Results", 0.99)],
+            # Genuine table lines: 2 columns, 3 rows
+            [[[10, 30], [90, 30], [90, 45], [10, 45]], ("Header A", 0.98)],
+            [[[110, 30], [190, 30], [190, 45], [110, 45]], ("Header B", 0.98)],
+            [[[10, 50], [90, 50], [90, 65], [10, 65]], ("Val 1", 0.95)],
+            [[[110, 50], [190, 50], [190, 65], [110, 65]], ("Val 2", 0.95)],
+            [[[10, 70], [90, 70], [90, 85], [10, 85]], ("Val 3", 0.95)],
+            [[[110, 70], [190, 70], [190, 85], [110, 85]], ("Val 4", 0.95)],
+        ]
+        rect = fitz.Rect(50, 100, 350, 300)
+        sub_elements, id_counter, summary = PaddleLayoutExtractor._process_figure_ocr_lines(
+            lines_detected, rect, 300, 200, page_num=1, page_w=612, page_h=792,
+            id_counter=1, base_font_size=11.0, existing_elements=[]
+        )
+        types = [e.get("type") for e in sub_elements]
+        self.assertIn("table", types)
+        # Verify table structure has kids (rows and cells)
+        table_el = next(e for e in sub_elements if e.get("type") == "table")
+        self.assertIn("kids", table_el)
+        self.assertGreaterEqual(len(table_el["kids"]), 2)
+
+    def test_digital_figure_with_adjacent_column_text_reading_order(self):
+        """Verify that digital composite figures (like Page 2 sample) keep distinct paragraphs, lists, and reading order."""
+        pdf_path = os.path.join(self.temp_dir, "composite_page2.pdf")
+        doc = fitz.open()
+        page = doc.new_page(width=648, height=855)
+
+        # Draw a photo on left
+        pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 100, 150), 1)
+        samples = bytearray(pix.samples)
+        for i in range(len(samples)):
+            samples[i] = (i * 37) % 256
+        pix_mod = fitz.Pixmap(fitz.csRGB, pix.width, pix.height, bytes(samples), 1)
+        page.insert_image(fitz.Rect(40, 10, 275, 415), pixmap=pix_mod)
+
+        # Draw quote text column next to photo (x in 280..340, y in 40..380)
+        page.insert_text((280, 50), "The past resembles the future more than one drop of water resembles another.", fontsize=9)
+        page.insert_text((280, 115), "IBN KHALDUN, ARAB HISTORIAN", fontsize=5)
+        page.insert_text((280, 270), "1. Who do you think the last person to see this sphinx was?", fontsize=6)
+        page.insert_text((280, 310), "2. Why do you think someone made the sphinx?", fontsize=6)
+
+        # Draw section 1 below photo
+        page.insert_text((60, 430), "Talk About the Quote", fontsize=14)
+        page.insert_text((60, 460), "1. Read aloud the quote at the top of the page.", fontsize=11)
+
+        # Draw section 2 on right
+        page.insert_text((400, 80), "ABOUT IBN KHALDUN", fontsize=12)
+        page.insert_text((400, 105), "Ibn Khaldun was a scholar from Tunisia.", fontsize=10)
+        page.insert_text((350, 430), "Share Your Ideas", fontsize=14)
+        page.insert_text((350, 460), "1. Guide discussion of the questions.", fontsize=11)
+
+        doc.save(pdf_path)
+        doc.close()
+
+        extracted = PaddleLayoutExtractor.extract_document(pdf_path)
+        elements = extracted["pages"][0]["elements"]
+
+        # Confirm Figure exists
+        fig_els = [e for e in elements if e.get("type") == "figure"]
+        self.assertEqual(len(fig_els), 1)
+
+        # Confirm quote text exists as distinct semantic elements (not swallowed into alt-text only)
+        all_content = " ".join(e.get("content", "") for e in elements)
+        self.assertIn("The past resembles the future", all_content)
+        self.assertIn("IBN KHALDUN", all_content)
+        self.assertIn("Talk About the Quote", all_content)
+        self.assertIn("ABOUT IBN KHALDUN", all_content)
+
+        # Confirm list items
+        list_items = [e for e in elements if e.get("tag") == "LI"]
+        self.assertGreaterEqual(len(list_items), 2)
+
+        # Verify reading order is strictly ascending
+        reading_orders = [e["reading_order"] for e in elements]
+        self.assertEqual(reading_orders, sorted(reading_orders))
+
+        # Test end-to-end PDF remediation
+        out_pdf = os.path.join(self.temp_dir, "composite_page2_tagged.pdf")
+        res = TaggingService.remediate_pdf(pdf_path, out_pdf)
+        self.assertTrue(res["success"])
+        self.assertTrue(os.path.exists(out_pdf))
+
+        # Verify structure tree in output PDF
+        with pikepdf.Pdf.open(out_pdf) as tagged_doc:
+            self.assertIn("/StructTreeRoot", tagged_doc.Root)
+            struct_root = tagged_doc.Root.StructTreeRoot
+            self.assertIn("/K", struct_root)
+
 
 if __name__ == "__main__":
     unittest.main()
+

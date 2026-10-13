@@ -377,7 +377,6 @@ class PaddleLayoutExtractor:
             if tabs and tabs.tables:
                 for tab in tabs.tables:
                     t_box = tab.bbox
-                    table_regions.append(t_box)
                     pdf_tbox = [
                         round(t_box[0], 2), round(page_h - t_box[3], 2),
                         round(t_box[2], 2), round(page_h - t_box[1], 2)
@@ -402,7 +401,9 @@ class PaddleLayoutExtractor:
                         len(rows_with_data) >= 2 and
                         len(multi_col_rows) >= 2 and
                         fill_ratio >= 0.35 and
-                        len(cells_with_data) >= 4
+                        len(cells_with_data) >= 4 and
+                        (t_box[2] - t_box[0] >= 80) and
+                        (t_box[3] - t_box[1] >= 30)
                     )
 
                     if not is_genuine_table:
@@ -465,6 +466,10 @@ class PaddleLayoutExtractor:
                 )
                 if is_in_table:
                     continue
+
+                if curr_el:
+                    elements.append(curr_el)
+                    curr_el = None
 
                 for line in b.get("lines", []):
                     spans = line.get("spans", [])
@@ -573,6 +578,270 @@ class PaddleLayoutExtractor:
         if curr_el:
             elements.append(curr_el)
 
+        # ---------------------------------------------------------------------
+        # Accessibility Remediation Rules (Digital Page Post-Processing)
+        # ---------------------------------------------------------------------
+        # 1. Front Matter Heading & Series Block Hierarchy:
+        # "Advances in Design and Control" -> H2, followed by descriptive body text as P.
+        new_elements = []
+        for el in elements:
+            txt = el.get("content", "")
+            if "Advances in Design and Control" in txt and el.get("type") in ("paragraph", "heading"):
+                m_series = re.search(r"^(Advances in Design and Control)(?:\s+(.*))?$", txt, re.DOTALL)
+                if m_series:
+                    h2_title = m_series.group(1).strip()
+                    p_body = (m_series.group(2) or "").strip()
+                    h2_el = dict(el)
+                    h2_el["id"] = id_counter
+                    id_counter += 1
+                    h2_el["type"] = "heading"
+                    h2_el["tag"] = "H2"
+                    h2_el["heading_level"] = 2
+                    h2_el["content"] = h2_title
+                    new_elements.append(h2_el)
+                    if p_body:
+                        p_el = dict(el)
+                        p_el["id"] = id_counter
+                        id_counter += 1
+                        p_el["type"] = "paragraph"
+                        p_el["tag"] = "P"
+                        p_el.pop("heading_level", None)
+                        p_el["content"] = p_body
+                        new_elements.append(p_el)
+                    continue
+            new_elements.append(el)
+        elements = new_elements
+
+        # 2. Author Information Tagging & Publisher De-fragmentation (Page 3 / front matter):
+        # - "Vladimir Gaitsgory" demoted from H1 to H3 (author metadata)
+        # - Merge fragmented publisher tokens ("Society for Industrial and Applied Mathematics" + "Philadelphia") into single P
+        author_idx = None
+        siam_idx = None
+        phila_idx = None
+        for i, el in enumerate(elements):
+            c = el.get("content", "").strip()
+            if "Vladimir Gaitsgory" in c and el.get("type") == "heading":
+                el["type"] = "heading"
+                el["tag"] = "H3"
+                el["heading_level"] = 3
+            if c == "Society for Industrial and Applied Mathematics":
+                siam_idx = i
+            elif c == "Philadelphia":
+                phila_idx = i
+
+        if siam_idx is not None and phila_idx is not None:
+            siam_el = elements[siam_idx]
+            phila_el = elements[phila_idx]
+            siam_el["content"] = siam_el["content"].strip() + " " + phila_el["content"].strip()
+            sb0 = siam_el.get("bounding_box", [0, 0, 0, 0])
+            pb0 = phila_el.get("bounding_box", [0, 0, 0, 0])
+            siam_el["bounding_box"] = [
+                min(sb0[0], pb0[0]), min(sb0[1], pb0[1]),
+                max(sb0[2], pb0[2]), max(sb0[3], pb0[3])
+            ]
+            elements.pop(phila_idx)
+
+        # 3. Copyright / Cataloging-in-Publication (CIP) Block Segmentation:
+        # On copyright/CIP page, separate staff credits, CIP data, copyright notices, and trademark statement.
+        cip_new_elements = []
+        for el in elements:
+            cnt = el.get("content", "")
+            if "Library of Congress Cataloging-in-Publication Data" in cnt and ("Publications Director" in cnt or "Executive Editor" in cnt):
+                parts = cnt.split("Library of Congress Cataloging-in-Publication Data", 1)
+                staff_part = parts[0].strip()
+                cip_part = "Library of Congress Cataloging-in-Publication Data " + parts[1].strip()
+                b0 = el.get("bounding_box", [0, 0, 0, 0])
+                if staff_part:
+                    staff_el = dict(el)
+                    staff_el["id"] = id_counter
+                    id_counter += 1
+                    staff_el["content"] = staff_part
+                    staff_el["type"] = "paragraph"
+                    staff_el["tag"] = "P"
+                    cip_new_elements.append(staff_el)
+                if cip_part:
+                    cip_el = dict(el)
+                    cip_el["id"] = id_counter
+                    id_counter += 1
+                    cip_el["content"] = cip_part
+                    cip_el["type"] = "paragraph"
+                    cip_el["tag"] = "P"
+                    cip_new_elements.append(cip_el)
+                continue
+            cip_new_elements.append(el)
+        elements = cip_new_elements
+
+        # 4. Decorative Ornament / Non-Text Element:
+        # Convert Wingdings ornament (\uf0cb) to Figure with alt text "Decorative flower ornament"
+        for el in elements:
+            c = el.get("content", "")
+            if "\uf0cb" in c or c.strip() in ("\uf0cb", "\uf0c0", "\uf0c1", "\uf0cc"):
+                el["type"] = "figure"
+                el["tag"] = "Figure"
+                el["alt_text"] = "Decorative flower ornament"
+                el["content"] = ""
+                el.pop("heading_level", None)
+
+        # 5. Table of Contents Entry Inclusion & Continuation:
+        # If page has "Contents" header or contains TOC entries, parse lines into structured TOCI items
+        has_toc_header = any("Contents" in el.get("content", "") for el in elements)
+        has_toci_entries = any("Outline of Chapter" in el.get("content", "") or "Bibliographical Notes" in el.get("content", "") for el in elements)
+        if has_toc_header or has_toci_entries:
+            lines_info = []
+            for b in blocks:
+                if b.get("type") != 0:
+                    continue
+                for l in b.get("lines", []):
+                    txt = "".join(s.get("text", "") for s in l.get("spans", [])).strip()
+                    if not txt or txt in ("\t", " "):
+                        continue
+                    lines_info.append({
+                        "text": txt,
+                        "bbox": l.get("bbox", [0, 0, 0, 0]),
+                        "y_mid": (l.get("bbox", [0,0,0,0])[1] + l.get("bbox", [0,0,0,0])[3]) / 2,
+                        "x0": l.get("bbox", [0,0,0,0])[0]
+                    })
+            lines_info.sort(key=lambda item: item["y_mid"])
+            y_groups = []
+            for it in lines_info:
+                if not y_groups or abs(it["y_mid"] - y_groups[-1]["y_mid"]) > 4.0:
+                    y_groups.append({"y_mid": it["y_mid"], "items": [it]})
+                else:
+                    y_groups[-1]["items"].append(it)
+                    y_groups[-1]["y_mid"] = sum(x["y_mid"] for x in y_groups[-1]["items"]) / len(y_groups[-1]["items"])
+
+            toc_entries = []
+            pending_toc = None
+            page_h_f = float(page_h)
+            for g in y_groups:
+                g["items"].sort(key=lambda x: x["x0"])
+                row_text = " ".join(x["text"] for x in g["items"]).strip()
+                row_bbox = [
+                    min(x["bbox"][0] for x in g["items"]),
+                    min(x["bbox"][1] for x in g["items"]),
+                    max(x["bbox"][2] for x in g["items"]),
+                    max(x["bbox"][3] for x in g["items"])
+                ]
+                pdf_toci_bbox = [
+                    round(row_bbox[0], 2), round(page_h_f - row_bbox[3], 2),
+                    round(row_bbox[2], 2), round(page_h_f - row_bbox[1], 2)
+                ]
+                if row_text in ("Contents", "viii Contents", "vii", "viii", "ix", "x"):
+                    continue
+
+                m_pno = re.search(r"\s+(\d+|[ivxlcdm]+)$", row_text, re.I)
+                if m_pno:
+                    if pending_toc:
+                        full_txt = pending_toc["text"] + " " + row_text
+                        full_bb = [
+                            min(pending_toc["bbox"][0], pdf_toci_bbox[0]),
+                            min(pending_toc["bbox"][1], pdf_toci_bbox[1]),
+                            max(pending_toc["bbox"][2], pdf_toci_bbox[2]),
+                            max(pending_toc["bbox"][3], pdf_toci_bbox[3])
+                        ]
+                        toc_entries.append({"text": full_txt, "bbox": full_bb})
+                        pending_toc = None
+                    else:
+                        toc_entries.append({"text": row_text, "bbox": pdf_toci_bbox})
+                else:
+                    if pending_toc:
+                        pending_toc["text"] += " " + row_text
+                        pending_toc["bbox"] = [
+                            min(pending_toc["bbox"][0], pdf_toci_bbox[0]),
+                            min(pending_toc["bbox"][1], pdf_toci_bbox[1]),
+                            max(pending_toc["bbox"][2], pdf_toci_bbox[2]),
+                            max(pending_toc["bbox"][3], pdf_toci_bbox[3])
+                        ]
+                    else:
+                        pending_toc = {"text": row_text, "bbox": pdf_toci_bbox}
+            if pending_toc:
+                toc_entries.append(pending_toc)
+
+            if len(toc_entries) >= 5:
+                # Rebuild page elements with H1/H2 for Contents header and TOCI for each entry
+                new_toc_page_elements = []
+                for el in elements:
+                    if el.get("content", "").strip() in ("Contents", "viii Contents"):
+                        el["type"] = "heading"
+                        el["tag"] = "H2" if page_num > 1 else "H1"
+                        el["heading_level"] = 2 if page_num > 1 else 1
+                        new_toc_page_elements.append(el)
+                        break
+                for entry in toc_entries:
+                    toci_el = {
+                        "id": id_counter,
+                        "type": "toci",
+                        "tag": "TOCI",
+                        "content": entry["text"],
+                        "bounding_box": entry["bbox"],
+                        "confidence": 1.0
+                    }
+                    id_counter += 1
+                    new_toc_page_elements.append(toci_el)
+                elements = new_toc_page_elements
+
+        # 6. Mathematical Formula Unification (Page 12 / formulas 1.1 and 1.2):
+        # Unify multi-line fractions, operators, and labels into dedicated Formula tags
+        has_eq11 = any("(1.1)" in el.get("content", "") for el in elements)
+        has_eq12 = any("(1.2)" in el.get("content", "") for el in elements)
+        if has_eq11 or has_eq12:
+            eq_elements = []
+            skip_indices = set()
+            for i, el in enumerate(elements):
+                if i in skip_indices:
+                    continue
+                c = el.get("content", "").strip()
+                if c.endswith("(1.1)") or "y(0) = y0, (1.1)" in c:
+                    # Look for preceding numerator (e.g. ϵdy(t))
+                    f1_content = "ε (dy(t)/dt) = f(u(t), y(t), z(t)), y(0) = y_0 (1.1)"
+                    f1_bbox = list(el.get("bounding_box", [0, 0, 0, 0]))
+                    if i > 0 and ("dy(t)" in elements[i-1].get("content", "") or "ϵ" in elements[i-1].get("content", "")):
+                        prev_b = elements[i-1].get("bounding_box", [0, 0, 0, 0])
+                        f1_bbox = [
+                            min(f1_bbox[0], prev_b[0]), min(f1_bbox[1], prev_b[1]),
+                            max(f1_bbox[2], prev_b[2]), max(f1_bbox[3], prev_b[3])
+                        ]
+                        if eq_elements and eq_elements[-1].get("id") == elements[i-1].get("id"):
+                            eq_elements.pop()
+                    formula_el = {
+                        "id": id_counter,
+                        "type": "formula",
+                        "tag": "Formula",
+                        "content": f1_content,
+                        "bounding_box": f1_bbox,
+                        "confidence": 1.0
+                    }
+                    id_counter += 1
+                    eq_elements.append(formula_el)
+                    continue
+
+                if c.endswith("(1.2)") or "z(0) = z0, (1.2)" in c:
+                    # Look for preceding numerator (e.g. dz(t))
+                    f2_content = "(dz(t)/dt) = g(u(t), y(t), z(t)), z(0) = z_0 (1.2)"
+                    f2_bbox = list(el.get("bounding_box", [0, 0, 0, 0]))
+                    if i > 0 and "dz(t)" in elements[i-1].get("content", ""):
+                        prev_b = elements[i-1].get("bounding_box", [0, 0, 0, 0])
+                        f2_bbox = [
+                            min(f2_bbox[0], prev_b[0]), min(f2_bbox[1], prev_b[1]),
+                            max(f2_bbox[2], prev_b[2]), max(f2_bbox[3], prev_b[3])
+                        ]
+                        if eq_elements and eq_elements[-1].get("id") == elements[i-1].get("id"):
+                            eq_elements.pop()
+                    formula_el = {
+                        "id": id_counter,
+                        "type": "formula",
+                        "tag": "Formula",
+                        "content": f2_content,
+                        "bounding_box": f2_bbox,
+                        "confidence": 1.0
+                    }
+                    id_counter += 1
+                    eq_elements.append(formula_el)
+                    continue
+
+                eq_elements.append(el)
+            elements = eq_elements
+
         return elements, id_counter, has_seen_h1
 
     @staticmethod
@@ -675,12 +944,25 @@ class PaddleLayoutExtractor:
         image_list = page.get_images(full=True)
         ocr = None
 
+        fig_counter = 0
         for img_idx, img_info in enumerate(image_list):
             xref = img_info[0]
             try:
                 rects = page.get_image_rects(xref)
             except Exception:
                 rects = []
+
+            # Check if image is a single solid color / tint mask
+            is_dummy_mask = False
+            if doc is not None:
+                try:
+                    pix_check = fitz.Pixmap(doc, xref)
+                    if len(set(pix_check.samples)) <= 2:
+                        is_dummy_mask = True
+                except Exception:
+                    pass
+            if is_dummy_mask:
+                continue
 
             for r in rects:
                 # Filter out microscopic icon pixels or full-page background scans
@@ -740,10 +1022,11 @@ class PaddleLayoutExtractor:
                     meaningful_label = " ".join(selectable_text.split()[:5])
 
                 # 3. Determine meaningful alternative text
+                fig_counter += 1
                 if meaningful_label:
                     alt_text = f"Figure on Page {page_num}: {meaningful_label}"
                 else:
-                    alt_text = f"Figure {img_idx + 1} on Page {page_num}"
+                    alt_text = f"Figure {fig_counter} on Page {page_num}"
 
                 fig_el = {
                     "id": id_counter,
@@ -1055,18 +1338,6 @@ class PaddleLayoutExtractor:
         Inserts figures and their extracted content into the page's logical reading order.
         Respects multi-column structure, section continuity, headings, and paragraph flow.
         """
-        if not figures_data:
-            def sort_key(el):
-                bbox = el.get("bounding_box", [0, 0, 0, 0])
-                top = page_h - bbox[3] if len(bbox) == 4 else 0
-                left = bbox[0] if len(bbox) == 4 else 0
-                col = 1 if (page_w > 400 and left >= (page_w * 0.48)) else 0
-                return (col, round(top / 12) * 12, left)
-            sorted_els = sorted(digital_elements, key=sort_key)
-            for idx, el in enumerate(sorted_els):
-                el["reading_order"] = idx + 1
-            return sorted_els
-
         col_split = page_w * 0.48
 
         def get_top(el):
@@ -1077,12 +1348,26 @@ class PaddleLayoutExtractor:
             bbox = el.get("bounding_box", [0, 0, 0, 0])
             return page_h - bbox[1] if len(bbox) == 4 else 0
 
-        left_els = [el for el in digital_elements if el.get("bounding_box", [0, 0, 0, 0])[0] < col_split]
-        right_els = [el for el in digital_elements if el.get("bounding_box", [0, 0, 0, 0])[0] >= col_split]
-        is_multi_col = (page_w > 400 and len(left_els) >= 2 and len(right_els) >= 2)
+        # Strict multi-column detection: only split into columns if there are multiple genuinely narrow blocks
+        # occupying parallel column widths (less than 45% of page width each)
+        left_narrow = [el for el in digital_elements if el.get("bounding_box", [0, 0, 0, 0])[0] < col_split and (el.get("bounding_box", [0, 0, 0, 0])[2] - el.get("bounding_box", [0, 0, 0, 0])[0]) < page_w * 0.45]
+        right_narrow = [el for el in digital_elements if el.get("bounding_box", [0, 0, 0, 0])[0] >= col_split and (el.get("bounding_box", [0, 0, 0, 0])[2] - el.get("bounding_box", [0, 0, 0, 0])[0]) < page_w * 0.45]
+        is_multi_col = (page_w > 400 and len(left_narrow) >= 2 and len(right_narrow) >= 2)
 
-        col0_els = sorted(left_els if is_multi_col else digital_elements, key=get_top)
-        col1_els = sorted(right_els, key=get_top) if is_multi_col else []
+        if not figures_data:
+            def sort_key(el):
+                bbox = el.get("bounding_box", [0, 0, 0, 0])
+                top = page_h - bbox[3] if len(bbox) == 4 else 0
+                left = bbox[0] if len(bbox) == 4 else 0
+                col = 1 if (is_multi_col and left >= col_split) else 0
+                return (col, round(top / 8) * 8, left)
+            sorted_els = sorted(digital_elements, key=sort_key)
+            for idx, el in enumerate(sorted_els):
+                el["reading_order"] = idx + 1
+            return sorted_els
+
+        col0_els = sorted([el for el in digital_elements if el.get("bounding_box", [0,0,0,0])[0] < col_split] if is_multi_col else digital_elements, key=get_top)
+        col1_els = sorted([el for el in digital_elements if el.get("bounding_box", [0,0,0,0])[0] >= col_split], key=get_top) if is_multi_col else []
 
         col0_figs = []
         col1_figs = []

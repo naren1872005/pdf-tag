@@ -712,6 +712,30 @@ class StructTreeBuilder:
                     parent_elem.K = Array()
                 parent_elem.K.append(p_dict)
                 p_dict.P = parent_elem
+            elif tag == "TOC" and str(parent_elem.get("/S", "")) in ("/Document", "/Part", "/Art", "/Sect"):
+                # Multi-Page TOC Continuation:
+                # Do not generate a disconnected new <TOC> root; link continuing <TOCI> entries
+                # directly under the existing primary <TOC> tree structure.
+                existing_root_toc = None
+                if "/K" in parent_elem:
+                    for k_child in parent_elem.K:
+                        if isinstance(k_child, Dictionary) and str(k_child.get("/S", "")) == "/TOC":
+                            existing_root_toc = k_child
+                            break
+                if existing_root_toc is not None:
+                    # Move all children of the newly built TOC element into existing_root_toc
+                    if "/K" in elem_dict:
+                        if "/K" not in existing_root_toc:
+                            existing_root_toc.K = Array()
+                        for toci_child in elem_dict.K:
+                            if isinstance(toci_child, Dictionary):
+                                toci_child.P = existing_root_toc
+                            existing_root_toc.K.append(toci_child)
+                else:
+                    if "/K" not in parent_elem:
+                        parent_elem.K = Array()
+                    parent_elem.K.append(elem_dict)
+                    elem_dict.P = parent_elem
             else:
                 if "/K" not in parent_elem:
                     parent_elem.K = Array()

@@ -429,7 +429,12 @@ class DigitalStreamTagger:
                     area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
                     if el_type == "figure" or tag == "Figure":
                         figure_nodes.append({"id": el_id, "bbox": bbox, "area": area, "tag": tag, "depth": depth})
-                    elif content.strip() and el_type not in DigitalStreamTagger.TEXT_TYPES_EXCLUDED and tag != "OBJR" \
+                    
+                    if el_type == "formula" or tag == "Formula":
+                        # Formula has text but also vector paths like fraction bars
+                        figure_nodes.append({"id": el_id, "bbox": bbox, "area": area, "tag": tag, "depth": depth})
+
+                    if el_type != "figure" and tag != "Figure" and content.strip() and el_type not in DigitalStreamTagger.TEXT_TYPES_EXCLUDED and tag != "OBJR" \
                             and tag not in DigitalStreamTagger.STRUCTURE_ONLY_TAGS \
                             and not (tag in ("LI", "TOCI") and el.get("kids")):
                         runs = []

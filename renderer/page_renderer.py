@@ -275,11 +275,10 @@ class PageRenderer:
                     artifact_nodes, node_id_to_tag,
                     elements=elements, crop_offset=json_crop_offset
                 )
-                # HYBRID only: nodes with no native glyphs that sit on a raster image
-                # (scanned region) get the invisible OCR text layer, exactly like the
-                # scanned flow. Nodes that DO have native text never get a second layer.
-                if "HYBRID" in document_type.upper():
-                    raster_fallback_nodes = set(getattr(DigitalStreamTagger, "raster_fallback_nodes", set()))
+                # Digital & Hybrid: nodes with no native glyphs that sit on a raster image
+                # (e.g. OCR text detected inside an embedded image) get the invisible OCR text layer,
+                # ensuring full accessibility without duplicating native text.
+                raster_fallback_nodes = set(getattr(DigitalStreamTagger, "raster_fallback_nodes", set()))
             except Exception as e:
                 import traceback
                 traceback.print_exc()
@@ -434,7 +433,7 @@ class PageRenderer:
                         annotation_map[el_id] = annot_dict
                         
                 # 2. Inline Links
-                inline_links = el.get("analysis", {}).get("inline_links", [])
+                inline_links = (el.get("analysis") or {}).get("inline_links", [])
                 font_runs = page_font_runs.get(el_id, [])
                 if inline_links and font_runs and not is_digital:
                     annot_rects = {}
@@ -507,7 +506,7 @@ class PageRenderer:
             )
             
             if lines_out or font_runs:
-                inline_links = el.get("analysis", {}).get("inline_links", [])
+                inline_links = (el.get("analysis") or {}).get("inline_links", [])
                 for link in inline_links:
                     if "start_offset" in link:
                         link["start_offset"] = int(link["start_offset"])

@@ -851,8 +851,10 @@ def _heading_level(el):
 def _set_heading_level(el, level):
     if _type(el) == "heading":
         el["heading_level"] = level
+        el["tag"] = f"H{level}"
     else:
         el["type"] = f"H{level}"
+        el["tag"] = f"H{level}"
 
 
 def ensure_h1(doc_json):
@@ -880,11 +882,30 @@ def ensure_h1(doc_json):
 
     headings = [(el, _heading_level(el)) for el, _ in ordered if _heading_level(el) is not None]
     if any(lv == 1 for _, lv in headings):
-        return ""
+        # Strict single-H1 rule: retain H1 exclusively for the primary document title.
+        # Demote all subsequent H1 headings to H2.
+        first_h1_found = False
+        demoted = 0
+        for el, lv in headings:
+            if lv == 1:
+                if not first_h1_found:
+                    first_h1_found = True
+                else:
+                    _set_heading_level(el, 2)
+                    demoted += 1
+        return f"single-H1 rule: retained primary H1, demoted {demoted} subsequent H1(s) to H2" if demoted else ""
     if headings:
         shift = min(lv for _, lv in headings) - 1
         for el, lv in headings:
             _set_heading_level(el, lv - shift)
+        # Ensure only the first promoted heading remains H1
+        first_h1_found = False
+        for el, lv in headings:
+            if (lv - shift) == 1:
+                if not first_h1_found:
+                    first_h1_found = True
+                else:
+                    _set_heading_level(el, 2)
         return f"no H1: heading levels moved up by {shift} (H{shift + 1} -> H1)"
 
     for el, inside in ordered:

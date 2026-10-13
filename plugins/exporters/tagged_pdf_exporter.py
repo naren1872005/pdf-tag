@@ -95,11 +95,13 @@ class TaggedPdfExporter(BasePlugin):
                 children = n.relations.get("children", [])
                 
                 # Derive reading order: from node, or if container, from first child
-                ro = n.semantic.get("reading_order") or n.metadata.get("reading_order")
+                n_meta = getattr(n, "metadata", {}) or {}
+                ro = n.semantic.get("reading_order") or n_meta.get("reading_order")
                 if ro is None and children:
                     first_child = graph.get_node(children[0])
                     if first_child:
-                        ro = first_child.semantic.get("reading_order") or first_child.metadata.get("reading_order") or first_child.id
+                        fc_meta = getattr(first_child, "metadata", {}) or {}
+                        ro = first_child.semantic.get("reading_order") or fc_meta.get("reading_order") or first_child.id
                 if ro is None:
                     ro = n.id if n.id is not None else 999999
 
@@ -110,7 +112,7 @@ class TaggedPdfExporter(BasePlugin):
                     "content": n.text,
                     "bounding_box": n.geometry.get("bbox", []),
                     "reading_order": ro,
-                    "analysis": n.analysis
+                    "analysis": getattr(n, "analysis", None)
                 }
                 for k, v in n.semantic.items():
                     if k not in ("type",):

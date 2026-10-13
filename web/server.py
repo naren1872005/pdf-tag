@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 from core.remediator import TaggingService
 
-app = FastAPI(title="TagPilot Web - PDF Accessibility Tagging Engine")
+app = FastAPI(title="Autotagging for Figure - PDF Accessibility Tagging Engine")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "web" / "static"
