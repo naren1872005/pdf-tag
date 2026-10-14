@@ -86,7 +86,15 @@ class StructTreeBuilder:
             K=Array()
         ))
         struct_tree_root.K = Array([doc_elem])
-        return struct_tree_root, doc_elem
+        
+        sect_elem = pdf.make_indirect(Dictionary(
+            Type=Name("/StructElem"),
+            S=Name("/Sect"),
+            P=doc_elem,
+            K=Array()
+        ))
+        doc_elem.K.append(sect_elem)
+        return struct_tree_root, sect_elem
 
 
     @staticmethod
@@ -470,9 +478,17 @@ class StructTreeBuilder:
             _alt = (el.get("alt_text") or "").strip() if el_type == "figure" else ""
             if _alt and _alt.lower() not in GENERIC_ALT:
                 elem_dict.Alt = pikepdf.String(_alt)
-                
+
             if el.get("actual_text"):
                 elem_dict.ActualText = pikepdf.String(el["actual_text"])
+            elif el.get("content") and tag in ("P", "LBody", "Lbl", "H1", "H2", "H3", "H4", "H5", "H6", "TH", "TD", "Span"):
+                kids = el.get("kids") or []
+                has_child_struct = any(isinstance(k, dict) and (k.get("type") in ("span", "link", "hyperlink", "reference") or str(k.get("tag", "")).upper() in ("SPAN", "LINK", "REFERENCE")) for k in kids)
+                if not has_child_struct:
+                    from export.structure_enforcer import normalize_word_spacing
+                    clean_txt = normalize_word_spacing(str(el["content"]).strip())
+                    if clean_txt:
+                        elem_dict.ActualText = pikepdf.String(clean_txt)
                 
             # Determine block-level context based on parent tag
             parent_s = parent_elem.get("/S")

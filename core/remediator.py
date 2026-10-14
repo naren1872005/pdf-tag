@@ -101,6 +101,12 @@ class TaggingService:
                     walk_fix_figures(root)
 
                 try:
+                    enforcer = StructureEnforcer()
+                    doc_json = enforcer.enforce(doc_json)
+                except Exception as enf_err:
+                    print(f"[WARN] Structure enforcement notice: {enf_err}")
+
+                try:
                     config = {"language": "en-US", "pdfua": {"part": 1, "display_doc_title": True}}
                     metadata = MetadataResolver.resolve(document_data=doc_json, config=config)
                     MetadataWriter.write(pdf, metadata)

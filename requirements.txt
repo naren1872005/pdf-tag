@@ -6,6 +6,7 @@ pydantic
 Pillow
 python-dotenv
 pyinstaller
+
 opencv-python
 fonttools
 pywin32

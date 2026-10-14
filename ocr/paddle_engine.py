@@ -154,6 +154,104 @@ class PaddleLayoutExtractor:
             if tag in ('Document', 'Sect', 'Part', 'Art', 'Div'):
                 return kids
 
+            if tag in ('Table', 'table'):
+                # Check if this table is a pseudo-table / layout container (e.g. sidebar box, callout, 1-row banner)
+                rows = []
+                cells = []
+                def collect_table(k_list):
+                    for k_item in k_list or []:
+                        if isinstance(k_item, dict):
+                            t_val = k_item.get('tag') or k_item.get('type')
+                            if t_val in ('TR', 'table_row'):
+                                rows.append(k_item)
+                                collect_table(k_item.get('kids'))
+                            elif t_val in ('TD', 'TH', 'table_data_cell', 'table_header_cell'):
+                                cells.append(k_item)
+                            elif k_item.get('kids'):
+                                collect_table(k_item.get('kids'))
+                collect_table(kids)
+                real_cells = [c for c in cells if bool((c.get('content') or '').strip()) or bool(c.get('kids'))]
+                is_layout = len(rows) <= 1 or len(real_cells) <= 1
+                if not is_layout and rows:
+                    row_cell_counts = []
+                    for r in rows:
+                        rc = [k for k in r.get('kids') or [] if (k.get('tag') or k.get('type')) in ('TD', 'TH', 'table_data_cell', 'table_header_cell')]
+                        row_cell_counts.append(len(rc))
+                    if row_cell_counts and max(row_cell_counts) <= 1:
+                        is_layout = True
+                if is_layout:
+                    # Dissolve layout table into its direct contents
+                    unwrapped = []
+                    def unwrap_content(k_item):
+                        if not isinstance(k_item, dict):
+                            return
+                        t_val = k_item.get('tag') or k_item.get('type')
+                        if t_val in ('Table', 'table', 'TR', 'table_row', 'TD', 'TH', 'table_data_cell', 'table_header_cell'):
+                            for sub_k in k_item.get('kids') or []:
+                                unwrap_content(sub_k)
+                            if not k_item.get('kids') and (k_item.get('content') or '').strip():
+                                b_box = k_item.get('bounding_box')
+                                if b_box and len(b_box) == 4:
+                                    w = abs(b_box[2] - b_box[0])
+                                    h = abs(b_box[3] - b_box[1])
+                                    if (w < 5.0 and h > 100.0) or w <= 0.1 or h <= 0.1:
+                                        return
+                                unwrapped.append({
+                                    'id': k_item.get('id', next(id_gen)),
+                                    'type': 'paragraph',
+                                    'tag': 'P',
+                                    'content': k_item.get('content'),
+                                    'bounding_box': b_box,
+                                    'confidence': 1.0
+                                })
+                        else:
+                            b_box = k_item.get('bounding_box')
+                            if b_box and len(b_box) == 4:
+                                w = abs(b_box[2] - b_box[0])
+                                h = abs(b_box[3] - b_box[1])
+                                if (w < 5.0 and h > 100.0) or w <= 0.1 or h <= 0.1:
+                                    return
+                            cnt = (k_item.get('content') or '').strip()
+                            m_split = re.match(r'^(1\.\s+.*?)(?:\s+|\n)(2\.\s+.*)$', cnt, re.DOTALL)
+                            if m_split:
+                                unwrapped.append({
+                                    'id': next(id_gen),
+                                    'type': 'list_item',
+                                    'tag': 'LI',
+                                    'content': m_split.group(1).strip(),
+                                    'bounding_box': b_box,
+                                    'confidence': 1.0
+                                })
+                                unwrapped.append({
+                                    'id': next(id_gen),
+                                    'type': 'list_item',
+                                    'tag': 'LI',
+                                    'content': m_split.group(2).strip(),
+                                    'bounding_box': b_box,
+                                    'confidence': 1.0
+                                })
+                            else:
+                                unwrapped.append(k_item)
+                    for k_item in kids:
+                        unwrap_content(k_item)
+
+                    merged_unwrapped = []
+                    for u in unwrapped:
+                        if merged_unwrapped and u.get('type') == 'paragraph' and merged_unwrapped[-1].get('type') == 'paragraph':
+                            b_prev = merged_unwrapped[-1].get('bounding_box')
+                            b_curr = u.get('bounding_box')
+                            if b_prev and b_curr and abs(b_prev[1] - b_curr[1]) <= 6 and 0 <= (b_curr[0] - b_prev[2]) <= 30:
+                                merged_unwrapped[-1]['content'] = f"{merged_unwrapped[-1]['content']} {u['content']}".strip()
+                                merged_unwrapped[-1]['bounding_box'] = [
+                                    min(b_prev[0], b_curr[0]),
+                                    min(b_prev[1], b_curr[1]),
+                                    max(b_prev[2], b_curr[2]),
+                                    max(b_prev[3], b_curr[3])
+                                ]
+                                continue
+                        merged_unwrapped.append(u)
+                    return merged_unwrapped
+
             text = extract_node_text(b)
             if not tag and not text and not kids:
                 return None
@@ -374,6 +472,87 @@ class PaddleLayoutExtractor:
         return extracted_doc
 
     @staticmethod
+    def _join_line_spans(spans):
+        """
+        Joins spans on a single line, inserting a space between spans where layout,
+        bounding boxes, or word boundaries indicate a missing separator.
+        Preserves legitimate hyphenation and avoids spaces in URLs, numbers, etc.
+        """
+        if not spans:
+            return ""
+        if len(spans) == 1:
+            return spans[0].get("text", "")
+        
+        parts = []
+        prev_s = None
+        for s in spans:
+            txt = s.get("text", "")
+            if not txt:
+                continue
+            if prev_s is None:
+                parts.append(txt)
+                prev_s = s
+                continue
+            
+            prev_txt = parts[-1]
+            if prev_txt.endswith(" ") or txt.startswith(" "):
+                parts.append(txt)
+                prev_s = s
+                continue
+            
+            prev_box = prev_s.get("bbox", [0, 0, 0, 0])
+            curr_box = s.get("bbox", [0, 0, 0, 0])
+            gap = curr_box[0] - prev_box[2]
+            min_fs = min(prev_s.get("size", 10.0), s.get("size", 10.0))
+            
+            # Preserve hyphenation
+            if prev_txt.rstrip().endswith(('-', '\u2010', '\u2011')) and txt.lstrip() and txt.lstrip()[0].isalpha():
+                parts.append(txt)
+                prev_s = s
+                continue
+                
+            # URL / email protection
+            joined_token = (prev_txt.split()[-1] if prev_txt.split() else "") + (txt.split()[0] if txt.split() else "")
+            if "@" in joined_token or joined_token.startswith(("http://", "https://", "www.")):
+                parts.append(txt)
+                prev_s = s
+                continue
+                
+            # Number with decimal or comma
+            if prev_txt.rstrip()[-1].isdigit() and (txt.lstrip().startswith(('.', ',')) or (prev_txt.rstrip().endswith(('.', ',')) and txt.lstrip()[0].isdigit())):
+                parts.append(txt)
+                prev_s = s
+                continue
+
+            prev_last_c = prev_txt.rstrip()[-1]
+            curr_first_c = txt.lstrip()[0]
+            
+            # Punctuation separator (e.g., 'Ask:' and 'What' in separate spans)
+            is_punct_boundary = (
+                (prev_last_c in (':', ';', '!', '?') and curr_first_c.isalnum()) or
+                (prev_last_c in (')', ']', '}', '"', '”') and curr_first_c.isalnum()) or
+                (prev_last_c.isalnum() and curr_first_c in ('(', '[', '{', '"', '“'))
+            )
+            
+            # Word space in typography is ~0.25-0.35 * fontsize (e.g. 2-3.5pt).
+            # Kerning inside a word is < 0.15 * fontsize (< 1.2pt).
+            is_word_space = gap >= max(1.5, 0.20 * min_fs)
+            is_punct_space = is_punct_boundary and gap >= 0.5
+            is_token_boundary = (
+                (prev_last_c.isalpha() and curr_first_c.isdigit() and len(prev_txt.strip()) >= 2) or
+                (prev_last_c.isdigit() and curr_first_c.isalpha()) or
+                (curr_box[1] > prev_box[1] + 2)
+            )
+            
+            if is_word_space or is_punct_space or is_token_boundary:
+                parts.append(" " + txt)
+            else:
+                parts.append(txt)
+            prev_s = s
+            
+        return "".join(parts)
+
+    @staticmethod
     def _extract_digital_page(page, page_num, page_w, page_h, id_counter, has_seen_h1, base_font_size):
         elements = []
         
@@ -477,6 +656,24 @@ class PaddleLayoutExtractor:
         blocks = page.get_text("dict", flags=fitz.TEXTFLAGS_SEARCH).get("blocks", [])
         curr_el = None
 
+        QUESTION_WORDS = {
+            "who", "what", "when", "where", "why", "how", "which", "whose", "whom",
+            "do", "does", "did", "is", "are", "was", "were", "can", "could", "would",
+            "should", "may", "might", "will"
+        }
+        INSTRUCTION_WORDS = {
+            "read", "write", "complete", "answer", "choose", "select", "fill", "find",
+            "solve", "model", "ask", "tell", "have", "use", "show", "check", "look",
+            "think", "guide", "explain", "discuss", "describe", "identify", "compare",
+            "contrast", "list", "define", "match", "circle", "underline", "draw",
+            "work", "practice", "note", "remember", "follow", "provide", "give", "state"
+        }
+        COMMON_SECTION_HEADINGS = {
+            "introduction", "overview", "summary", "background", "methodology", "methods",
+            "materials", "results", "discussion", "conclusion", "conclusions", "references",
+            "bibliography", "appendix", "index", "glossary", "preface", "foreword"
+        }
+
         for b in blocks:
             if b.get("type") == 0:  # text block
                 b_box = b.get("bbox", [0, 0, 0, 0])
@@ -496,7 +693,7 @@ class PaddleLayoutExtractor:
 
                 for line in b.get("lines", []):
                     spans = line.get("spans", [])
-                    line_text = "".join(s.get("text", "") for s in spans).strip()
+                    line_text = PaddleLayoutExtractor._join_line_spans(spans).strip()
                     if not line_text:
                         continue
 
@@ -518,7 +715,7 @@ class PaddleLayoutExtractor:
 
                     max_s = max((s.get("size", 10.0) for s in spans), default=10.0)
                     has_bold = any(
-                        s.get("flags", 0) & 2 or "bold" in s.get("font", "").lower() or "black" in s.get("font", "").lower()
+                        s.get("flags", 0) & 2 or any(k in s.get("font", "").lower() for k in ("bold", "black", "semibold", "semi-bold", "demi", "heavy", "medium"))
                         for s in spans
                     )
 
@@ -530,8 +727,8 @@ class PaddleLayoutExtractor:
 
                     # Check for hierarchical outline section numbering:
                     # e.g., "2", "2.", "2.1", "2.2", "2.2.1", "2.2.1.2", "2.3.1.2"
-                    # Rule: Heading levels follow document outline rather than visual appearance ("same font, size, bold").
-                    outline_match = re.match(r'^\s*(?:(?:Chapter|Section)\s+)?(\d+(?:\.\d+)*)\.?\s*(\S.*)?$', line_text, re.IGNORECASE)
+                    # Rule: Heading levels follow document outline rather than visual appearance alone.
+                    outline_match = re.match(r'^\s*(?:(?:Chapter|Section|Part|Appendix)\s+)?(\d+(?:\.\d+)*)\.?\s*(\S.*)?$', line_text, re.IGNORECASE)
                     is_outline_heading = False
                     outline_h_level = None
 
@@ -542,29 +739,35 @@ class PaddleLayoutExtractor:
 
                         if len(parts) >= 2:
                             # Multi-level numbered section heading (2.1, 2.2, 2.2.1, 2.2.1.2, etc.)
-                            # Even with same font family, font size, and bold formatting ("same font, size, bold"):
-                            # Heading level is strictly determined by outline depth:
-                            # 2 parts (2.1, 2.2, 2.3) -> H2
-                            # 3 parts (2.2.1, 2.3.1) -> H3
-                            # 4 parts (2.2.1.2, 2.3.1.2) -> H4
                             if len(line_text) < 120 and (has_bold or not title_part.endswith('.') or max_s >= base_font_size * 1.0):
                                 is_outline_heading = True
                                 outline_h_level = min(6, len(parts))
                         elif len(parts) == 1:
-                            # Single-number top-level section (e.g. "2." or "2. Introduction" or "Chapter 2")
-                            # A multi-word sentence / instruction (e.g. "1. Direct students' attention...") is a list item, not a section heading.
-                            has_ch_prefix = bool(re.match(r'^\s*(?:Chapter|Section)\s+', line_text, re.IGNORECASE))
+                            # Single-number section e.g. "Chapter 2" or "1. Introduction"
+                            # Multi-word questions, sentences, or instructions (e.g. "1. Who do you think...", "1. Read aloud...")
+                            # are list items, NOT section headings!
+                            has_ch_prefix = bool(re.match(r'^\s*(?:Chapter|Section|Part|Appendix)\s+', line_text, re.IGNORECASE))
                             title_words = title_part.split()
-                            is_short_title = bool(title_part) and len(title_words) <= 5 and len(line_text) < 45 and not title_part.endswith('.') and not any(p in title_part for p in (',', ';', ':', '?', '!'))
-                            is_title_candidate = (
+                            w0 = title_words[0].lower().rstrip(':,;.?!') if title_words else ""
+                            is_question_or_instruction = (
+                                w0 in QUESTION_WORDS or
+                                w0 in INSTRUCTION_WORDS or
+                                title_part.endswith('?') or
+                                line_text.endswith('?') or
+                                w0 in ("a", "an", "the", "in", "on", "at", "to", "for", "with", "by", "from", "if", "then", "as", "that", "this") or
+                                any(p in title_part for p in (',', ';', ':', '?', '!')) or
+                                title_part.endswith('.')
+                            )
+                            is_common = w0 in COMMON_SECTION_HEADINGS or title_part.lower() in COMMON_SECTION_HEADINGS
+                            is_short_title = bool(title_part) and len(title_words) <= 5 and len(line_text) < 45 and not is_question_or_instruction
+                            is_title_candidate = not is_question_or_instruction and (
                                 has_ch_prefix or
+                                is_common or
                                 (line_text.isupper() and len(line_text) < 35 and any(c.isalpha() for c in line_text)) or
-                                (is_short_title and (has_bold or max_s >= base_font_size * 1.15)) or
-                                (not bool(title_part) and len(line_text) < 10 and max_s >= base_font_size * 1.15)
+                                (is_short_title and (has_bold or max_s >= base_font_size * 1.15))
                             )
                             if is_title_candidate:
                                 is_outline_heading = True
-                                # Rule: "2. H1 -> only once in pdf"
                                 if not has_seen_h1:
                                     outline_h_level = 1
                                     has_seen_h1 = True
@@ -579,13 +782,14 @@ class PaddleLayoutExtractor:
 
                     # Heading classification based on typography hierarchy (for non-numbered headings)
                     is_h1 = (max_s >= base_font_size * 1.8) and (len(line_text) < 90) and (not has_seen_h1)
-                    is_h2 = (max_s >= base_font_size * 1.25) and (len(line_text) < 90) and not line_text.endswith('.')
+                    is_h2 = (
+                        (max_s >= base_font_size * 1.25 and len(line_text) < 90 and not line_text.endswith('.')) or
+                        (line_text.isupper() and len(line_text) < 35 and any(c.isalpha() for c in line_text) and not line_text.endswith('.'))
+                    )
                     is_page_number = bool(re.match(r'^[A-Za-z]?\d{1,5}$', line_text.strip()))
-                    is_h3 = (
-                        not is_page_number and (
-                            (has_bold and max_s >= base_font_size * 1.05 and len(line_text) < 65 and not line_text.endswith('.')) or
-                            (line_text.isupper() and len(line_text) < 30 and not line_text.endswith('.') and any(c.isalpha() for c in line_text))
-                        )
+                    is_h3 = not is_page_number and (
+                        (has_bold and max_s >= base_font_size * 0.95 and len(line_text) < 65 and 1 <= len(line_text.split()) <= 7 and not line_text.endswith(('.', ':', ';', ',', '!', '?'))) or
+                        (line_text.isupper() and len(line_text) < 30 and not line_text.endswith('.') and any(c.isalpha() for c in line_text))
                     )
 
                     if is_outline_heading:
@@ -627,7 +831,7 @@ class PaddleLayoutExtractor:
                         elif is_h2:
                             h_level = 2
                         else:
-                            h_level = 3
+                            h_level = 2  # Subheadings like Listening and Speaking, Learning Strategies are H2
 
                         curr_el = {
                             "id": id_counter,
@@ -637,6 +841,7 @@ class PaddleLayoutExtractor:
                             "content": line_text,
                             "bounding_box": pdf_bbox,
                             "font_size": round(max_s, 1),
+                            "is_bold": has_bold,
                             "confidence": 1.0
                         }
                         id_counter += 1
@@ -644,8 +849,29 @@ class PaddleLayoutExtractor:
                     else:
                         # Continuation or Paragraph
                         if curr_el and curr_el["type"] == "list_item":
+                            # A line that is bold, short, and title-like is NEVER a continuation of a list item
+                            is_bold_title = has_bold and len(line_text) < 65 and 1 <= len(line_text.split()) <= 7 and not line_text.endswith('.')
+                            if is_bold_title:
+                                elements.append(curr_el)
+                                curr_el = {
+                                    "id": id_counter,
+                                    "type": "heading",
+                                    "tag": "H2",
+                                    "heading_level": 2,
+                                    "content": line_text,
+                                    "bounding_box": pdf_bbox,
+                                    "font_size": round(max_s, 1),
+                                    "is_bold": True,
+                                    "confidence": 1.0
+                                }
+                                id_counter += 1
+                                continue
+
                             # Indented / wrapped continuation of previous list item
-                            curr_el["content"] += " " + line_text
+                            if curr_el["content"].rstrip().endswith(('-', '\u2010', '\u2011')) and line_text and line_text[0].isalpha():
+                                curr_el["content"] = curr_el["content"].rstrip() + line_text.lstrip()
+                            else:
+                                curr_el["content"] = curr_el["content"].rstrip() + " " + line_text.lstrip()
                             b0 = curr_el["bounding_box"]
                             curr_el["bounding_box"] = [
                                 min(b0[0], pdf_bbox[0]), min(b0[1], pdf_bbox[1]),
@@ -653,7 +879,10 @@ class PaddleLayoutExtractor:
                             ]
                         elif curr_el and curr_el["type"] == "paragraph":
                             # Merge regular paragraph lines
-                            curr_el["content"] += " " + line_text
+                            if curr_el["content"].rstrip().endswith(('-', '\u2010', '\u2011')) and line_text and line_text[0].isalpha():
+                                curr_el["content"] = curr_el["content"].rstrip() + line_text.lstrip()
+                            else:
+                                curr_el["content"] = curr_el["content"].rstrip() + " " + line_text.lstrip()
                             b0 = curr_el["bounding_box"]
                             curr_el["bounding_box"] = [
                                 min(b0[0], pdf_bbox[0]), min(b0[1], pdf_bbox[1]),
@@ -945,6 +1174,32 @@ class PaddleLayoutExtractor:
                 eq_elements.append(el)
             elements = eq_elements
 
+        # 7. Merge Unit/Chapter prefix with following unit title
+        # e.g., "UNIT 7" + "The Past" -> single <H1> "UNIT 7 The Past"
+        merged_unit_elements = []
+        skip_idx = -1
+        for i, el in enumerate(elements):
+            if i == skip_idx:
+                continue
+            txt = (el.get("content") or el.get("text") or "").strip()
+            m_unit = re.match(r'^(UNIT|CHAPTER|PART|MODULE|LESSON|SECTION)\s*(\d+)$', txt, re.IGNORECASE)
+            if m_unit and i + 1 < len(elements):
+                next_el = elements[i + 1]
+                next_txt = (next_el.get("content") or next_el.get("text") or "").strip()
+                if len(next_txt) < 80 and not next_txt.endswith('.') and not re.match(r'^(?:UNIT|CHAPTER|PART)\b', next_txt, re.I):
+                    prefix = f"{m_unit.group(1).upper()} {m_unit.group(2)}"
+                    el["content"] = f"{prefix} {next_txt}"
+                    b0 = el.get("bounding_box", [0, 0, 0, 0])
+                    b1 = next_el.get("bounding_box", [0, 0, 0, 0])
+                    el["bounding_box"] = [min(b0[0], b1[0]), min(b0[1], b1[1]), max(b0[2], b1[2]), max(b0[3], b1[3])]
+                    el["type"] = "heading"
+                    el["tag"] = "H1"
+                    el["heading_level"] = 1
+                    has_seen_h1 = True
+                    skip_idx = i + 1
+            merged_unit_elements.append(el)
+        elements = merged_unit_elements
+
         return elements, id_counter, has_seen_h1
 
     @staticmethod
@@ -1128,6 +1383,17 @@ class PaddleLayoutExtractor:
                 fig_counter += 1
                 if meaningful_label:
                     alt_text = f"Figure on Page {page_num}: {meaningful_label}"
+                    if existing_elements:
+                        f_rect = fitz.Rect(round(r.x0, 2), round(r.y0, 2), round(r.x1, 2), round(r.y1, 2))
+                        clean_existing = []
+                        for el in existing_elements:
+                            b = el.get("bounding_box", [0, 0, 0, 0])
+                            el_rect = fitz.Rect(b[0], page_h - b[3], b[2], page_h - b[1])
+                            t = (el.get("content") or el.get("text") or "").strip()
+                            if f_rect.contains(el_rect) and (t.lower() in meaningful_label.lower() or meaningful_label.lower().endswith(t.lower())):
+                                continue
+                            clean_existing.append(el)
+                        existing_elements[:] = clean_existing
                 else:
                     alt_text = f"Figure {fig_counter} on Page {page_num}"
 
@@ -1506,8 +1772,8 @@ class PaddleLayoutExtractor:
 
         if not figures_data:
             if is_multi_col:
-                col0 = sorted([e for e in body_elements if e.get("bounding_box", [0,0,0,0])[0] < col_split], key=get_top)
-                col1 = sorted([e for e in body_elements if e.get("bounding_box", [0,0,0,0])[0] >= col_split], key=get_top)
+                col0 = sorted([e for e in body_elements if (e.get("bounding_box", [0,0,0,0])[0] + e.get("bounding_box", [0,0,0,0])[2]) / 2.0 < col_split], key=get_top)
+                col1 = sorted([e for e in body_elements if (e.get("bounding_box", [0,0,0,0])[0] + e.get("bounding_box", [0,0,0,0])[2]) / 2.0 >= col_split], key=get_top)
                 sorted_els = top_headers + col0 + col1 + bot_footers
             else:
                 def sort_key(el):
@@ -1520,8 +1786,8 @@ class PaddleLayoutExtractor:
                 el["reading_order"] = idx + 1
             return sorted_els
 
-        col0_els = sorted([el for el in body_elements if el.get("bounding_box", [0,0,0,0])[0] < col_split] if is_multi_col else body_elements, key=get_top)
-        col1_els = sorted([el for el in body_elements if el.get("bounding_box", [0,0,0,0])[0] >= col_split], key=get_top) if is_multi_col else []
+        col0_els = sorted([el for el in body_elements if (el.get("bounding_box", [0,0,0,0])[0] + el.get("bounding_box", [0,0,0,0])[2]) / 2.0 < col_split] if is_multi_col else body_elements, key=get_top)
+        col1_els = sorted([el for el in body_elements if (el.get("bounding_box", [0,0,0,0])[0] + el.get("bounding_box", [0,0,0,0])[2]) / 2.0 >= col_split], key=get_top) if is_multi_col else []
 
         col0_figs = []
         col1_figs = []
@@ -1529,9 +1795,10 @@ class PaddleLayoutExtractor:
 
         for f_data in figures_data:
             w = f_data["right_x"] - f_data["left_x"]
+            center_x = (f_data["left_x"] + f_data["right_x"]) / 2.0
             if is_multi_col and w >= page_w * 0.65:
                 spanning_figs.append(f_data)
-            elif is_multi_col and f_data["left_x"] >= col_split:
+            elif is_multi_col and (center_x >= col_split or f_data["left_x"] >= page_w * 0.40):
                 col1_figs.append(f_data)
             else:
                 col0_figs.append(f_data)
@@ -1556,10 +1823,9 @@ class PaddleLayoutExtractor:
                     insert_pos = preceding_idx + 1
                     result[insert_pos:insert_pos] = fig_content
                 else:
-                    if result and result[0].get("type") == "heading" and result[0].get("heading_level") == 1:
-                        result[1:1] = fig_content
-                    else:
-                        result[0:0] = fig_content
+                    # Place figure at the end of the column text so it does not interrupt
+                    # continuous lists or paragraph flow across columns
+                    result.extend(fig_content)
             return result
 
         final_col0 = insert_into_col(col0_els, col0_figs)

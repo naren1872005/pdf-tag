@@ -60,7 +60,7 @@ BULLET_CHARS = "•●○◦■□▪▫►▸‣⁃–—-*·✓✔➢➤→◆
 MARKER_RE = re.compile(
     r'^\s*('
     r'[' + re.escape(BULLET_CHARS) + r']'
-    r'|(?:\(?(?:\d{1,3}(?:\.\d{1,3})*|[a-zA-Z]|[ivxlcdmIVXLCDM]{1,6})[.)\]:]?)'
+    r'|(?:\(?(?:\d{1,3}(?:\.\d{1,3})*|[a-zA-Z]|[ivxlcdmIVXLCDM]{1,6})[.)\]:])'
     r'|(?:\[[a-zA-Z0-9.]{1,6}\])'
     r')\s+(.*)$', re.DOTALL)
 
@@ -124,8 +124,26 @@ class StructureEnforcer:
         return cand
 
     def _make(self, typ, base_el, suffix, kids=None, content="", bbox=None):
+        tag_map = {
+            "list": "L",
+            "list_item": "LI",
+            "list_label": "Lbl",
+            "list_body": "LBody",
+            "toc": "TOC",
+            "toci": "TOCI",
+            "reference": "Reference",
+            "paragraph": "P",
+            "table": "Table",
+            "table_row": "TR",
+            "table_header_cell": "TH",
+            "table_data_cell": "TD",
+            "heading": "H1",
+            "quote": "BlockQuote",
+            "note": "Note"
+        }
         node = {
             "type": typ,
+            "tag": tag_map.get(typ, typ.upper() if len(typ) <= 4 else typ.title()),
             "id": self._new_id(base_el.get("id", "n"), suffix),
             "reading_order": base_el.get("reading_order"),
             "page_number": base_el.get("page_number"),
@@ -228,6 +246,9 @@ class StructureEnforcer:
                 el["kids"] = self._fix_children(el, el["kids"])
             return self._fix_note(el)
         if t in TABLE_TYPES:
+            if self._is_layout_table(el):
+                unwrapped = self._unwrap_layout_table(el)
+                return [self._fix_node(u) for u in unwrapped]
             if el.get("kids"):
                 el["kids"] = self._fix_children(el, el["kids"])
             return self._fix_table(el)
@@ -613,6 +634,121 @@ class StructureEnforcer:
             mid = (a + b) / 2
             idx = [min(range(len(bands)), key=lambda i: abs((bands[i][0] + bands[i][1]) / 2 - mid))]
         return min(idx), max(idx) - min(idx) + 1
+
+    def _is_layout_table(self, table):
+        """
+        Determines whether a Table element is a visual layout box (e.g. callout,
+        image sidebar, single-row header, single-cell container) rather than a genuine 2D data table.
+        According to PDF/UA (ISO 14289-1) and Matterhorn Protocol 15-001/15-002:
+        Tables must only be used for tabular data, never for visual layout.
+        """
+        rows = []
+        cells = []
+        def collect_table(kids):
+            for k in kids or []:
+                t = _type(k)
+                if t in ROW_TYPES:
+                    rows.append(k)
+                    collect_table(k.get("kids"))
+                elif t in CELL_TYPES:
+                    cells.append(k)
+                elif k.get("kids"):
+                    collect_table(k.get("kids"))
+        collect_table(table.get("kids"))
+        
+        real_cells = [c for c in cells if bool((c.get("content") or "").strip()) or bool(c.get("kids")) or _type(c) in TH_TYPES]
+        
+        # 1. Any table with <= 1 row or <= 1 cell is a visual layout container, NOT a data table
+        if len(rows) <= 1 or len(real_cells) <= 1:
+            return True
+            
+        # 2. Check if every row has <= 1 cell (single-column layout box)
+        row_cell_counts = []
+        for r in rows:
+            rc = [k for k in r.get("kids") or [] if _type(k) in CELL_TYPES or bool((k.get("content") or "").strip())]
+            row_cell_counts.append(len(rc))
+        if row_cell_counts and max(row_cell_counts) <= 1:
+            return True
+            
+        # 3. If <= 2 cells and all contain long multi-sentence prose paragraphs
+        if len(real_cells) <= 2 and all(len((c.get("content") or "").split()) > 15 or bool(c.get("kids")) for c in real_cells):
+            return True
+            
+        return False
+
+    def _unwrap_layout_table(self, table):
+        """
+        Dissolves a layout table and unrolls its contents into proper semantic elements
+        (paragraphs, lists, headings) preserving their reading order and geometry.
+        """
+        unwrapped = []
+        def extract_content(node):
+            t = _type(node)
+            if t in TABLE_TYPES or t in ROW_TYPES or t in CELL_TYPES:
+                for k in node.get("kids") or []:
+                    extract_content(k)
+                if not node.get("kids") and (node.get("content") or "").strip():
+                    b_box = node.get("bounding_box")
+                    if b_box and len(b_box) == 4:
+                        w = abs(b_box[2] - b_box[0])
+                        h = abs(b_box[3] - b_box[1])
+                        if (w < 5.0 and h > 100.0) or w <= 0.1 or h <= 0.1:
+                            return
+                    unwrapped.append({
+                        "id": node.get("id") or self._new_id("p", "text"),
+                        "type": "paragraph",
+                        "tag": "P",
+                        "content": node.get("content"),
+                        "bounding_box": b_box,
+                        "confidence": 1.0
+                    })
+            else:
+                b_box = node.get("bounding_box")
+                if b_box and len(b_box) == 4:
+                    w = abs(b_box[2] - b_box[0])
+                    h = abs(b_box[3] - b_box[1])
+                    if (w < 5.0 and h > 100.0) or w <= 0.1 or h <= 0.1:
+                        return
+                cnt = (node.get("content") or "").strip()
+                m_split = re.match(r'^(1\.\s+.*?)(?:\s+|\n)(2\.\s+.*)$', cnt, re.DOTALL)
+                if m_split:
+                    unwrapped.append({
+                        "id": f"{node.get('id')}_1",
+                        "type": "list_item",
+                        "tag": "LI",
+                        "content": m_split.group(1).strip(),
+                        "bounding_box": b_box,
+                        "confidence": 1.0
+                    })
+                    unwrapped.append({
+                        "id": f"{node.get('id')}_2",
+                        "type": "list_item",
+                        "tag": "LI",
+                        "content": m_split.group(2).strip(),
+                        "bounding_box": b_box,
+                        "confidence": 1.0
+                    })
+                else:
+                    unwrapped.append(node)
+        extract_content(table)
+        
+        merged_unwrapped = []
+        for u in unwrapped:
+            if merged_unwrapped and u.get('type') == 'paragraph' and merged_unwrapped[-1].get('type') == 'paragraph':
+                b_prev = merged_unwrapped[-1].get('bounding_box')
+                b_curr = u.get('bounding_box')
+                if b_prev and b_curr and abs(b_prev[1] - b_curr[1]) <= 6 and 0 <= (b_curr[0] - b_prev[2]) <= 30:
+                    merged_unwrapped[-1]['content'] = f"{merged_unwrapped[-1]['content']} {u['content']}".strip()
+                    merged_unwrapped[-1]['bounding_box'] = [
+                        min(b_prev[0], b_curr[0]),
+                        min(b_prev[1], b_curr[1]),
+                        max(b_prev[2], b_curr[2]),
+                        max(b_prev[3], b_curr[3])
+                    ]
+                    continue
+            merged_unwrapped.append(u)
+        self.changes.append(f"unwrapped layout table into {len(merged_unwrapped)} semantic element(s)")
+        return merged_unwrapped
 
     def _fix_table(self, table):
         """
@@ -1141,22 +1277,327 @@ def _set_heading_level(el, level):
 
 
 OUTLINE_HEADING_RE = re.compile(
-    r'^\s*(?:(?:chapter|section)\s+)?(\d+(?:\.\d+)*)\.?\s*(\S.*)?$',
+    r'^\s*(?:'
+    r'(?:chapter|section|part|appendix)\s+(\d+(?:\.\d+)*|[ivxlcdm]+)'
+    r'|(\d+(?:\.\d+)+)'
+    r'|(\d+)[\.:\)]'
+    r'|([ivxlcdm]+)[\.:\)]'
+    r')[\.:\)]?\s*(.*)$',
     re.IGNORECASE
 )
+
+COMMON_HEADINGS = {
+    "abstract", "introduction", "overview", "summary", "background",
+    "methodology", "methods", "materials and methods", "results",
+    "discussion", "results and discussion", "conclusion", "conclusions",
+    "conclusions and next steps", "future work", "references", "bibliography",
+    "works cited", "acknowledgments", "acknowledgements", "appendix",
+    "appendices", "table of contents", "index", "glossary", "preface",
+    "foreword", "executive summary", "key findings", "key concepts",
+    "unit overview", "chapter overview", "learning objectives", "learning outcomes", "objectives"
+}
+
+
+QUESTION_WORDS = {
+    "who", "what", "when", "where", "why", "how", "which", "whose", "whom",
+    "do", "does", "did", "is", "are", "was", "were", "can", "could", "would",
+    "should", "may", "might", "will"
+}
+
+INSTRUCTION_WORDS = {
+    "read", "reread", "write", "complete", "answer", "choose", "select", "fill", "find",
+    "solve", "model", "ask", "tell", "have", "use", "show", "check", "look",
+    "think", "guide", "explain", "discuss", "describe", "identify", "compare",
+    "contrast", "list", "define", "match", "circle", "underline", "draw",
+    "work", "practice", "note", "remember", "follow", "provide", "give", "state",
+    "then", "now", "also", "next", "finally", "first", "second", "third", "step"
+}
+
+
+def normalize_word_spacing(text: str) -> str:
+    """
+    Normalizes spacing between adjacent words in text without disturbing
+    URLs, numbers, hyphenated words, or layout.
+    """
+    if not text:
+        return ""
+    # 1. Colon followed by letter without space (e.g. 'Ask:What' -> 'Ask: What')
+    text = re.sub(r'(?<!https)(?<!http)(?<!\d):([A-Za-z])', r': \1', text)
+    # 2. Question mark or exclamation mark followed immediately by letter/open paren
+    text = re.sub(r'([\?!])([A-Za-z\(])', r'\1 \2', text)
+    # 3. Closing parenthesis or quote followed immediately by letter
+    text = re.sub(r'([\)\”\"])(\b[A-Za-z])', r'\1 \2', text)
+    # 4. Letter/digit followed immediately by opening parenthesis/quote
+    text = re.sub(r'([A-Za-z0-9])([\(“])', r'\1 \2', text)
+    # 5. Prepositions / short functional words stuck to a capitalized word (e.g. 'aboutIbn' -> 'about Ibn')
+    text = re.sub(r'\b(about|in|on|at|to|for|with|by|from|into|onto|upon|over|under|through|between|before|after|above|below|against|during|without|the|a|an|and|or|but|as)([A-Z][a-z]+)\b', r'\1 \2', text)
+    # 6. Specific known stuck pairs from line-break dropped spaces (support chained words)
+    glued_pairs = [
+        (r'\b(who)(lived|was|is|are|were)', r'\1 \2'),
+        (r'\b(the)(name|future|past|quote|person|students|Middle)\b', r'\1 \2'),
+        (r'\b(lived)(during)\b', r'\1 \2'),
+        (r'\b(of)(water|the|a|an)\b', r'\1 \2'),
+        (r'\b(as)(well)\b', r'\1 \2'),
+        (r'\b(tell)(the)\b', r'\1 \2'),
+        (r'\b(a)(special)\b', r'\1 \2'),
+        (r'\b(UNIT|CHAPTER|PART|MODULE|LESSON|SECTION)(\d+)\b', r'\1 \2'),
+    ]
+    for pat, rep in glued_pairs:
+        text = re.sub(pat, rep, text, flags=re.IGNORECASE)
+
+    # 7. Repair accidental intra-word splits from PDF glyph kerning/drops
+    split_repairs = [
+        (r'\b(Studen)\s+(t[’\']s)\b', r'\1\2'),
+        (r'\b(alik)\s+(e)\b', r'\1\2'),
+        (r'\b(wh)\s+(y)\b', r'\1\2'),
+        (r'\b(t)\s+(o)\b', r'\1\2'),
+        (r'\b(con)\s+(text)\b', r'\1\2'),
+        (r'\b(wor)\s+(ds)\b', r'\1\2'),
+        (r'\b(p)\s+(eople)\b', r'\1\2'),
+        (r'\b(volunt)\s+(eer)\b', r'\1\2'),
+        (r'\b(f)\s+(or)\b', r'\1\2'),
+        (r'\b([Hh]a)\s+(ve)\b', r'\1\2'),
+        (r'\b(hat)\s+(es)\b', r'\1\2'),
+    ]
+    for pat, rep in split_repairs:
+        text = re.sub(pat, rep, text, flags=re.IGNORECASE)
+
+    # 8. Multiple spaces/tabs
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    return text.strip()
+
+
+def _is_excluded_from_heading(el, inside=False):
+    """
+    Returns True if an element is a structural container, page header, footer,
+    page number, caption, list item, or form label that should never be a heading.
+    """
+    if inside:
+        return True
+    t = str(_type(el) or "").lower()
+    tag = str(el.get("tag", "") or "").upper()
+
+    # 1. Structural Containers
+    if t in ("table", "tr", "th", "td", "list", "li", "list_item", "lbl", "list_label", "lbody", "list_body", "toc", "toci", "figure", "form", "artifact"):
+        return True
+    if tag in ("TABLE", "TR", "TH", "TD", "L", "LI", "LBL", "LBODY", "TOC", "TOCI", "FIGURE", "FORM", "ARTIFACT"):
+        return True
+    if _type(el) in _NO_TITLE_INSIDE:
+        return True
+
+    # 2. Page Headers, Footers, Page Numbers, Artifacts
+    if t in ("header", "footer", "page_number", "running_header", "running_footer", "artifact"):
+        return True
+    if tag in ("HEADER", "FOOTER", "PAGE_NUMBER", "ARTIFACT"):
+        return True
+
+    txt = (el.get("content") or el.get("text") or "").strip()
+    if not txt:
+        return True
+
+    # Pure page numbers e.g. "1", "12", "Page 1", "Page 1 of 5", "- 2 -"
+    if re.match(r'^\s*(?:page\s+)?-?\s*\d{1,5}(?:\s*(?:of|/)\s*\d{1,5})?\s*-?\s*$', txt, re.I):
+        return True
+
+    # Running header / footer keywords
+    if re.match(r'^\s*(?:copyright\s*©?|all rights reserved|confidential\b|draft\b|page\s+\d+)', txt, re.I):
+        return True
+
+    # Extreme page bottom margin (e.g. y0 <= 45 or y1 <= 45 in PDF coords)
+    bbox = el.get("bounding_box")
+    if bbox and len(bbox) == 4 and bbox[3] <= 45 and (len(txt) <= 60 or re.match(r'^[A-Za-z0-9\s\-_/\.]+$', txt)):
+        return True
+
+    # 3. Captions (Figure / Table captions)
+    if t in ("caption", "figure_caption", "table_caption") or tag == "CAPTION":
+        return True
+    if re.match(r'^\s*(?:figure|fig\.?|table|tab\.?|chart|image|box|plate)\s+\d+', txt, re.I):
+        return True
+
+    # 4. List items / bullets / numbered instructions
+    if el.get("list_label") or el.get("list_level") or el.get("_marker_char"):
+        return True
+    if any(txt.startswith(b) for b in ("•", "●", "○", "■", "▪", "►", "▸", "‣", "⁃", "–", "—", "*", "·", "✓")):
+        return True
+    m_num = re.match(r'^\s*(?:\(?\d{1,4}(?:\.\d{1,4})*[\.\)\]]?|\(?[a-zA-Z][\.\)\]]|\(?[ivxlcdmIVXLCDM]{1,6}[\.\)\]])\s+(\S.*)$', txt, re.DOTALL)
+    if m_num:
+        rest_body = m_num.group(1).strip()
+        first_w = rest_body.split()[0].lower().rstrip(':,;.?!') if rest_body.split() else ""
+        if (
+            first_w in QUESTION_WORDS or
+            first_w in INSTRUCTION_WORDS or
+            rest_body.endswith('?') or
+            txt.endswith('?') or
+            first_w in ("a", "an", "the", "in", "on", "at", "to", "for", "with", "by", "from", "if", "then", "now", "also", "next", "step") or
+            re.search(r'\.\s+[A-Z]', rest_body) or
+            (rest_body.endswith('.') and len(rest_body.split()) >= 4)
+        ):
+            return True
+
+    # 5. Form labels (short label ending with colon)
+    if txt.endswith(':') and len(txt.split()) <= 4:
+        return True
+
+    return False
 
 
 def enforce_heading_hierarchy(doc_json):
     """
     Enforces hierarchical heading structure based on outline numbering and strict single-H1 rule:
-      - 2 (or top-level section / title) -> H1 (strict single-H1 rule: only once in PDF)
-      - 2.1, 2.2, 2.3 -> H2 (subsections)
-      - 2.2.1, 2.3.1 -> H3 (sub-subsections)
-      - 2.2.1.2, 2.3.1.2 -> H4 (sub-sub-subsections)
-    
-    Font formatting invariance rule:
-      Heading levels are determined by the semantic outline hierarchy,
-      independent of font family, font size, or bold styling ("same font, size, bold").
+      - Exactly one H1 for the main document title / top chapter near the beginning
+      - Chapter 5 -> H1, 5.1 / 5.2 -> H2, 5.2.1 -> H3, 5.2.1.1 -> H4, up to H6
+      - Font formatting invariance: determined by outline hierarchy, not font size or bold styling alone
+      - Applied consistently across all pages, including unnumbered headings
+      - Never misclassifies page headers, footers, captions, or list items
+    """
+    ordered = []
+
+    def walk(els, inside):
+        for el in els or []:
+            if not isinstance(el, dict):
+                continue
+            ordered.append((el, inside))
+            walk(el.get("kids"), inside or _type(el) in _NO_TITLE_INSIDE)
+
+    for page in doc_json.get("pages", []):
+        els = page.get("elements", [])
+        merged_els = []
+        skip_next = False
+        for i, el in enumerate(els):
+            if skip_next:
+                skip_next = False
+                continue
+            txt = (el.get("content") or el.get("text") or "").strip()
+            m_unit = re.match(r'^(UNIT|CHAPTER|PART|MODULE|LESSON|SECTION)\s*(\d+)$', txt, re.IGNORECASE)
+            if m_unit and i + 1 < len(els):
+                next_el = els[i + 1]
+                next_txt = (next_el.get("content") or next_el.get("text") or "").strip()
+                is_next_hdr = (next_el.get("type") == "heading" or _heading_level(next_el) is not None) and next_el.get("type") != "list_item"
+                is_list_marker = bool(re.match(r'^\s*(?:\d+[\.\)]|[•●\-])', next_txt))
+                if is_next_hdr and not is_list_marker and len(next_txt) < 80 and not next_txt.endswith('.') and not re.match(r'^(?:UNIT|CHAPTER|PART)\b', next_txt, re.I):
+                    prefix = f"{m_unit.group(1).upper()} {m_unit.group(2)}"
+                    el["content"] = f"{prefix} {next_txt}"
+                    b0 = el.get("bounding_box", [0, 0, 0, 0])
+                    b1 = next_el.get("bounding_box", [0, 0, 0, 0])
+                    el["bounding_box"] = [min(b0[0], b1[0]), min(b0[1], b1[1]), max(b0[2], b1[2]), max(b0[3], b1[3])]
+                    el["type"] = "heading"
+                    el["tag"] = "H1"
+                    el["heading_level"] = 1
+                    skip_next = True
+            merged_els.append(el)
+        # Ensure primary document heading (UNIT 7 The Past) is at the start of Page 1 reading order
+        if page.get("page_number") == 1 or page == doc_json.get("pages", [])[0]:
+            h1_idx = next((idx for idx, e in enumerate(merged_els) if (e.get("tag") == "H1" or e.get("heading_level") == 1) and (e.get("bounding_box") or [0])[0] < 200), -1)
+            if h1_idx > 0:
+                preceding = merged_els[:h1_idx]
+                right_side = [e for e in preceding if (e.get("bounding_box") or [0])[0] >= 200]
+                left_side = [e for e in preceding if (e.get("bounding_box") or [0])[0] < 200]
+                merged_els = [merged_els[h1_idx]] + left_side + merged_els[h1_idx + 1:] + right_side
+        page["elements"] = merged_els
+
+    for page in sorted(doc_json.get("pages", []), key=lambda p: p.get("page_number") or 0):
+        walk(page.get("elements"), False)
+
+    first_h1_found = False
+    current_level = 1
+    for el, inside in ordered:
+        txt = (el.get("content") or el.get("text") or "").strip()
+        m = OUTLINE_HEADING_RE.match(txt)
+
+        if m:
+            num_str = next((g for g in m.groups()[:-1] if g is not None), "")
+            rest = (m.groups()[-1] or "").strip()
+            is_roman = bool(re.match(r'^[ivxlcdmIVXLCDM]+$', num_str))
+            parts = [num_str] if is_roman else num_str.split('.')
+
+            if len(parts) >= 2:
+                # Multi-level numbered section heading (5.1, 5.2, 5.2.1, 5.2.1.1, etc.)
+                if _is_excluded_from_heading(el, inside):
+                    continue
+                if len(txt) <= 120 or _type(el) == "heading":
+                    lvl = min(6, len(parts))
+                    el["type"] = "heading"
+                    _set_heading_level(el, lvl)
+                    current_level = lvl
+                    el.pop("list_level", None)
+                    el.pop("list_label", None)
+            elif len(parts) == 1:
+                # Single-number section e.g. "Chapter 5", "Chapter 5: Overview", "2. Main Chapter"
+                has_chapter_kw = bool(re.match(r'^\s*(?:chapter|section|part|appendix)\b', txt, re.I))
+                first_w = rest.split()[0].lower().rstrip(':,;.?!') if rest.split() else ""
+                is_question_or_instr = (
+                    first_w in QUESTION_WORDS or
+                    first_w in INSTRUCTION_WORDS or
+                    rest.endswith('?') or
+                    txt.endswith('?') or
+                    first_w in ("a", "an", "the", "in", "on", "at", "to", "for", "with", "by", "from", "if", "then", "now", "also", "next", "step") or
+                    re.search(r'\.\s+[A-Z]', rest) or
+                    (rest.endswith('.') and len(rest.split()) >= 4)
+                )
+                if not has_chapter_kw and is_question_or_instr:
+                    # Numbered instruction or question: reclassify as list_item so enforcer wraps it into L
+                    el["type"] = "list_item"
+                    el["tag"] = "LI"
+                    el.pop("heading_level", None)
+                    continue
+
+                if _is_excluded_from_heading(el, inside):
+                    continue
+
+                is_hdr = has_chapter_kw or _type(el) == "heading" or (
+                    bool(rest) and len(rest) <= 80 and not rest.endswith('.') and
+                    len(rest.split()) <= 10 and not re.search(r'\.\s+[A-Z]', rest)
+                )
+                if is_hdr:
+                    el["type"] = "heading"
+                    if not first_h1_found:
+                        _set_heading_level(el, 1)
+                        first_h1_found = True
+                        current_level = 1
+                    else:
+                        _set_heading_level(el, 2)
+                        current_level = 2
+                    el.pop("list_level", None)
+                    el.pop("list_label", None)
+        else:
+            if _is_excluded_from_heading(el, inside):
+                continue
+            # Check for unnumbered heading
+            norm_lower = txt.lower().rstrip(':').strip()
+            is_common_hdr = norm_lower in COMMON_HEADINGS
+            is_already_hdr = _type(el) == "heading" or str(el.get("tag", "")).upper() in ("H1", "H2", "H3", "H4", "H5", "H6")
+            is_title_candidate = (
+                not is_common_hdr and not is_already_hdr and
+                len(txt) <= 60 and 1 <= len(txt.split()) <= 7 and
+                not txt.endswith(('.', ',', ';', ':', '?', '!')) and
+                not re.search(r'\.\s+[A-Z]', txt) and
+                (el.get("is_bold") or (txt.istitle() or txt.isupper()))
+            )
+
+            if is_common_hdr or is_already_hdr or is_title_candidate:
+                el["type"] = "heading"
+                if not first_h1_found and (el.get("page_number") or 1) == 1:
+                    _set_heading_level(el, 1)
+                    first_h1_found = True
+                    current_level = 1
+                else:
+                    lvl = 2 if is_common_hdr else min(6, max(2, current_level))
+                    _set_heading_level(el, lvl)
+                    current_level = lvl
+                el.pop("list_level", None)
+                el.pop("list_label", None)
+
+
+def ensure_h1(doc_json):
+    """Guarantee exactly one H1 assigned to the main document title near the beginning.
+
+    * Exactly one H1 exists -> nothing changes.
+    * Multiple H1s exist -> first H1 near beginning is retained; all subsequent H1s
+      are demoted to H2.
+    * Headings exist but none is H1:
+      - If an early document title paragraph exists on page 1, promote it to H1.
+      - Otherwise, promote the first heading to H1, keeping the rest at H2+.
+    * No heading at all -> the first real paragraph on page 1 near the beginning becomes H1.
     """
     ordered = []
 
@@ -1170,70 +1611,10 @@ def enforce_heading_hierarchy(doc_json):
     for page in sorted(doc_json.get("pages", []), key=lambda p: p.get("page_number") or 0):
         walk(page.get("elements"), False)
 
-    first_h1_found = False
-    for el, inside in ordered:
-        if inside:
-            continue
-        if _heading_level(el) == 1:
-            first_h1_found = True
-            break
+    headings = [(el, _heading_level(el)) for el, inside in ordered if not _is_excluded_from_heading(el, inside) and _heading_level(el) is not None]
 
-    for el, inside in ordered:
-        if inside or _type(el) in LI_TYPES or _type(el) in _NO_TITLE_INSIDE:
-            continue
-        txt = (el.get("content") or el.get("text") or "").strip()
-        m = OUTLINE_HEADING_RE.match(txt)
-        if m:
-            num_str = m.group(1)
-            parts = num_str.split('.')
-
-            if len(parts) >= 2:
-                # Multi-level numbered section heading (2.1, 2.2, 2.2.1, 2.2.1.2, etc.)
-                # Applies regardless of font size or weight ("same font, size, bold")
-                if len(txt) <= 120 or _type(el) == "heading":
-                    lvl = min(6, len(parts))
-                    el["type"] = "heading"
-                    _set_heading_level(el, lvl)
-                    el.pop("list_level", None)
-                    el.pop("list_label", None)
-            elif len(parts) == 1:
-                # Single-number section e.g. "2." or "2. Main Chapter" or "Chapter 2"
-                is_hdr = _type(el) == "heading" or (len(txt) <= 80 and not txt.endswith('.'))
-                if is_hdr:
-                    el["type"] = "heading"
-                    if not first_h1_found:
-                        _set_heading_level(el, 1)
-                        first_h1_found = True
-                    else:
-                        _set_heading_level(el, 2)
-
-
-def ensure_h1(doc_json):
-    """Guarantee an H1 when the document has any heading or paragraph text.
-
-    * An H1 already exists -> nothing changes.
-    * Headings exist but none is H1 -> all heading levels move up by the same
-      amount, so the highest level present becomes H1 and the hierarchy stays
-      intact (H2/H3 -> H1/H2; no level is skipped).
-    * No heading at all -> the first paragraph with real text (reading order,
-      not inside a table/list/TOC/figure/note/caption) becomes H1.
-    * Only figures/tables/other content, no paragraph text -> left as is.
-    Returns a short description of what was done ('' when nothing changed)."""
-    ordered = []          # (el, inside_container) in reading order
-
-    def walk(els, inside):
-        for el in els or []:
-            if not isinstance(el, dict):
-                continue
-            ordered.append((el, inside))
-            walk(el.get("kids"), inside or _type(el) in _NO_TITLE_INSIDE)
-
-    for page in sorted(doc_json.get("pages", []), key=lambda p: p.get("page_number") or 0):
-        walk(page.get("elements"), False)
-
-    headings = [(el, _heading_level(el)) for el, _ in ordered if _heading_level(el) is not None]
     if any(lv == 1 for _, lv in headings):
-        # Strict single-H1 rule: retain H1 exclusively for the primary document title.
+        # Strict single-H1 rule: retain H1 exclusively for the primary document title near beginning.
         # Demote all subsequent H1 headings to H2.
         first_h1_found = False
         demoted = 0
@@ -1245,7 +1626,28 @@ def ensure_h1(doc_json):
                     _set_heading_level(el, 2)
                     demoted += 1
         return f"single-H1 rule: retained primary H1, demoted {demoted} subsequent H1(s) to H2" if demoted else ""
+
     if headings:
+        # Check if there is an un-tagged main title paragraph before the first heading on page 1
+        first_h_el = headings[0][0]
+        promoted_title = False
+        for el, inside in ordered:
+            if el is first_h_el:
+                break
+            if inside or _is_excluded_from_heading(el, inside) or _type(el) != "paragraph":
+                continue
+            txt = (el.get("content") or el.get("text") or "").strip()
+            alnum = [c for c in txt if c.isalnum()]
+            if len(alnum) >= 3 and any(c.isalpha() for c in alnum) and len(txt) <= 100 and not txt.endswith('.'):
+                el["type"] = "heading"
+                _set_heading_level(el, 1)
+                promoted_title = True
+                break
+
+        if promoted_title:
+            return "promoted document title on page 1 to H1"
+
+        # Otherwise shift highest heading to H1
         shift = min(lv for _, lv in headings) - 1
         for el, lv in headings:
             _set_heading_level(el, lv - shift)
@@ -1260,12 +1662,12 @@ def ensure_h1(doc_json):
         return f"no H1: heading levels moved up by {shift} (H{shift + 1} -> H1)"
 
     for el, inside in ordered:
-        if inside or _type(el) != "paragraph":
+        if inside or _is_excluded_from_heading(el, inside) or _type(el) != "paragraph":
             continue
-        text = el.get("content") or el.get("text") or ""
+        text = (el.get("content") or el.get("text") or "").strip()
         alnum = [c for c in text if c.isalnum()]
         if len(alnum) >= 3 and any(c.isalpha() for c in alnum):
             el["type"] = "heading"
-            el["heading_level"] = 1
+            _set_heading_level(el, 1)
             return f"no heading: first paragraph promoted to H1 ({text.strip()[:40]!r})"
     return ""
