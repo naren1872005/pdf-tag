@@ -490,6 +490,8 @@ def wrap_unreadable_labels(pdf):
         else:
             source = hint                         # drawn bullet: label from the extractor
         actual = label_words(source)
+        if actual.strip().lower() == "bullet":
+            actual = " Bullet "
         pg = pages[pi]
         span = pdf.make_indirect(Dictionary(Type=Name("/StructElem"), S=Name("/Span"), P=e,
                                             Pg=e.get("/Pg", pg.obj), ActualText=pikepdf.String(actual)))

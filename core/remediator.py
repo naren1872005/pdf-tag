@@ -168,11 +168,16 @@ class TaggingService:
         ensure_h1(doc_json)
         attach_toc_targets(doc_json)
 
+        # 4. Geometry Preparation & Span Enforcement
+        fitz_doc = fitz.open(input_pdf)
+
+        from export.span_enforcer import SpanEnforcer
+        span_enforcer = SpanEnforcer()
+        doc_json = span_enforcer.enforce(doc_json, fitz_doc=fitz_doc)
+
         if progress_callback:
             progress_callback(3, 4, "Building StructTreeRoot & marking content streams...")
 
-        # 4. Geometry Preparation
-        fitz_doc = fitz.open(input_pdf)
         page_frames = {}
         try:
             with pikepdf.Pdf.open(input_pdf) as src_pdf:
@@ -229,6 +234,8 @@ class TaggingService:
                 return "Form" if el_type in ("Form", "form_field") else "Link"
             if el_type == "footnote_note":
                 return "Note"
+            if el_type in ("Span", "span"):
+                return "Span"
             return AccessibilityMapper.get_tag(el_type, el)
 
         # Determine whether PDF is born-digital or scanned

@@ -32,7 +32,9 @@ class AccessibilityMapper:
         "toc_item": "TOCI",
         "reference": "Reference",
         "link": "Link",
-        "objr": "OBJR"
+        "objr": "OBJR",
+        "span": "Span",
+        "Span": "Span"
     }
 
     @classmethod
@@ -45,7 +47,7 @@ class AccessibilityMapper:
             "P", "H1", "H2", "H3", "H4", "H5", "H6", "H",
             "LI", "LBody", "Table", "TR", "TH", "TD", "Figure",
             "Caption", "Form", "Link", "Note", "Reference", "L", "Lbl",
-            "TOC", "TOCI", "OBJR"
+            "TOC", "TOCI", "OBJR", "Span"
         }
         if el_type in explicit_tags:
             return el_type

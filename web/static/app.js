@@ -475,6 +475,23 @@ function renderTagTree() {
 }
 
 function getElementSummaryText(el) {
+  const tag = (el.tag || el.type || '').toUpperCase();
+
+  // For LBL with Span child, the bullet belongs strictly inside Span, not on LBL
+  if ((tag === 'LBL' || el.type === 'list_label') && el.kids && el.kids.length > 0) {
+    return '';
+  }
+
+  // For Span, display bullet content directly
+  if (tag === 'SPAN' || el.type === 'span') {
+    if (el.content && el.content.trim()) {
+      return el.content.trim();
+    }
+    if (el.actual_text && el.actual_text.trim()) {
+      return el.actual_text.trim();
+    }
+  }
+
   if (el.content && el.content.trim()) {
     return el.content.trim();
   }
@@ -484,7 +501,6 @@ function getElementSummaryText(el) {
   if (el.alt_text && el.alt_text.trim()) {
     return el.alt_text.trim();
   }
-  const tag = (el.tag || el.type || '').toUpperCase();
   
   // For LI (list_item), extract Lbl and LBody text from kids
   if (tag === 'LI' || el.type === 'list_item') {
@@ -494,7 +510,11 @@ function getElementSummaryText(el) {
       el.kids.forEach(k => {
         const kTag = (k.tag || k.type || '').toUpperCase();
         if (kTag === 'LBL' || k.type === 'list_label') {
-          lblTxt = getElementSummaryText(k);
+          if (k.content && k.content.trim()) {
+            lblTxt = k.content.trim();
+          } else if (k.kids && k.kids.length > 0) {
+            lblTxt = (k.kids[0].content || k.kids[0].actual_text || '').trim();
+          }
         } else if (kTag === 'LBODY' || k.type === 'list_body') {
           bodyTxt = getElementSummaryText(k);
         }
@@ -530,6 +550,9 @@ function getElementSummaryText(el) {
 
   // If node has kids, concatenate a preview of text
   if (el.kids && el.kids.length > 0) {
+    if (tag === 'LBL' || el.type === 'list_label') {
+      return '';
+    }
     let combined = '';
     for (const kid of el.kids) {
       const kt = getElementSummaryText(kid);
@@ -556,12 +579,16 @@ function renderElementTreeNode(el, pNum, container) {
 
   const tagLabel = getTagDisplayLabel(el);
   const colorClass = getTagColorClass(el);
+  const isLbl = (tagLabel === 'Lbl' || (el.tag || '').toUpperCase() === 'LBL' || el.type === 'list_label');
   const summaryText = getElementSummaryText(el);
-  const displayContent = summaryText || (el.kids && el.kids.length > 0 ? `${el.kids.length} items` : 'Content');
+  const displayContent = (isLbl && el.kids && el.kids.length > 0) ? '' : (summaryText || (el.kids && el.kids.length > 0 ? `${el.kids.length} items` : 'Content'));
+  const tooltipText = (el.actual_text && el.actual_text.trim() && el.actual_text.trim() !== displayContent)
+    ? `${displayContent} (ActualText: ${el.actual_text.trim()})`
+    : displayContent;
 
   itemEl.innerHTML = `
     <span class="tag-badge tag-${colorClass}">&lt;${tagLabel}&gt;</span>
-    <span class="tree-content" title="${escapeHtml(displayContent)}">${escapeHtml(displayContent)}</span>
+    ${displayContent ? `<span class="tree-content" title="${escapeHtml(tooltipText)}">${escapeHtml(displayContent)}</span>` : ''}
   `;
 
   itemEl.addEventListener('mouseenter', () => highlightElement(el.id));

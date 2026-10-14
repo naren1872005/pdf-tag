@@ -118,6 +118,14 @@ def process_pdf_worker(task_id: str):
         save_task_meta(task)
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    fav = STATIC_DIR / "favicon.png"
+    if fav.exists():
+        return FileResponse(fav)
+    return Response(status_code=204)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
     index_file = STATIC_DIR / "index.html"

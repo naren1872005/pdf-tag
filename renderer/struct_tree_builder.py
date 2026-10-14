@@ -516,6 +516,18 @@ class StructTreeBuilder:
             if tag in ("TH", "TD"):
                 StructTreeBuilder._apply_table_cell_attrs(pdf, elem_dict, el, tag)
                 
+            if tag == "Span":
+                if el.get("underline") or (el.get("attributes") and el["attributes"].get("Underline") in (True, "true", "True")):
+                    layout_dict = Dictionary(O=Name("/Layout"), TextDecorationType=Name("/Underline"))
+                    if "/A" not in elem_dict:
+                        elem_dict.A = pdf.make_indirect(layout_dict)
+                    else:
+                        existing_a = elem_dict.A
+                        if isinstance(existing_a, Dictionary):
+                            existing_a.TextDecorationType = Name("/Underline")
+                        elif isinstance(existing_a, Array):
+                            existing_a.append(layout_dict)
+
             if tag == "Form":
                 annot_info = el.get("annotation", {})
                 if annot_info.get("rect"):
@@ -566,7 +578,14 @@ class StructTreeBuilder:
                     # if kids were all artifacts and no OBJRs, remove K array
                     del elem_dict["K"]
                     
-            if mcid is not None:
+            has_child_struct_elems = False
+            if "/K" in elem_dict and isinstance(elem_dict.K, Array):
+                has_child_struct_elems = any(
+                    isinstance(x, Dictionary) and str(x.get("/Type", "")) == "/StructElem"
+                    for x in elem_dict.K
+                )
+
+            if mcid is not None and not has_child_struct_elems:
                 # Node with content
                 if "/K" not in elem_dict:
                     elem_dict.K = Array()

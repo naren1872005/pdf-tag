@@ -457,7 +457,23 @@ class PaddleLayoutExtractor:
         except Exception:
             pass
 
-        # 2. Text line and block extraction
+        # 2. Text line and block extraction with Underline vector detection
+        underline_rects = []
+        try:
+            for d in page.get_drawings():
+                r = d.get("rect")
+                if r and r.height <= 3.5 and 4.0 <= r.width <= 0.75 * page_w:
+                    underline_rects.append(r)
+                for it in d.get("items", []):
+                    if it[0] == "l":
+                        p1, p2 = it[1], it[2]
+                        if abs(p1.y - p2.y) <= 1.5:
+                            lw = abs(p2.x - p1.x)
+                            if 4.0 <= lw <= 0.75 * page_w:
+                                underline_rects.append(fitz.Rect(min(p1.x, p2.x), min(p1.y, p2.y) - 1, max(p1.x, p2.x), max(p1.y, p2.y) + 1))
+        except Exception:
+            pass
+
         blocks = page.get_text("dict", flags=fitz.TEXTFLAGS_SEARCH).get("blocks", [])
         curr_el = None
 
@@ -487,6 +503,18 @@ class PaddleLayoutExtractor:
                     # Filter out isolated artifact tabs/spaces
                     if line_text in ("\t", " ", ""):
                         continue
+
+                    line_underlined = False
+                    for s in spans:
+                        sb = s.get("bbox", [0, 0, 0, 0])
+                        is_u = any(
+                            ur.x0 <= sb[2] + 2 and ur.x1 >= sb[0] - 2 and
+                            (0 <= ur.y0 - sb[3] <= 4.0 or abs(ur.y0 - sb[3]) <= 2.5)
+                            for ur in underline_rects
+                        )
+                        if is_u:
+                            s["underline"] = True
+                            line_underlined = True
 
                     max_s = max((s.get("size", 10.0) for s in spans), default=10.0)
                     has_bold = any(
@@ -644,6 +672,11 @@ class PaddleLayoutExtractor:
                                 "confidence": 1.0
                             }
                             id_counter += 1
+
+                    if curr_el:
+                        if line_underlined:
+                            curr_el["underline"] = True
+                        curr_el.setdefault("_spans_meta", []).extend(spans)
 
         if curr_el:
             elements.append(curr_el)

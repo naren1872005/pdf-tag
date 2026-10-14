@@ -318,6 +318,17 @@ class PageRenderer:
                 # PDF Object References (like Link / Form annotations) do not render text
                 return
 
+            if el_type not in ("table", "table_row", "table_header_cell", "table_data_cell") and el.get("kids"):
+                has_span_or_text_kids = any(
+                    k.get("type") in ("span", "Span", "paragraph", "reference", "link", "hyperlink") or
+                    (get_tag_fn and get_tag_fn(k.get("type"), k) in ("Span", "P", "Link", "Reference"))
+                    for k in el["kids"]
+                )
+                if has_span_or_text_kids:
+                    for kid in el["kids"]:
+                        process_element(kid)
+                    return
+
             if el_type in ("table", "table_row", "table_header_cell", "table_data_cell", "list", "list_item", "document", "toc", "TOC", "toci", "TOCI", "reference", "Reference") or tag_name in ("TOC", "TOCI", "Reference"):
                 # These are structural containers
                 kids = el.get("kids")
