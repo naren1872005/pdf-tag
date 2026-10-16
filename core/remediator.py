@@ -137,9 +137,9 @@ class TaggingService:
                         stats["paragraphs_count"] += 1
                     elif "figure" in t or tg == "FIGURE":
                         stats["figures_count"] += 1
-                    elif "list" in t or tg in ("L", "LI", "LBL", "LBODY"):
+                    elif t in ("list", "ordered_list", "unordered_list") or tg == "L":
                         stats["lists_count"] += 1
-                    elif "table" in t or tg in ("TABLE", "TR", "TH", "TD"):
+                    elif t == "table" or tg == "TABLE":
                         stats["tables_count"] += 1
                     if el.get("kids"):
                         count_stat_elements(el["kids"])
@@ -242,7 +242,42 @@ class TaggingService:
                 return "Note"
             if el_type in ("Span", "span"):
                 return "Span"
+            if el_type in ("formula", "Formula") or (el and str(el.get("tag", "")).upper() == "FORMULA"):
+                return "Formula"
             return AccessibilityMapper.get_tag(el_type, el)
+
+        # Defensive check: Guarantee every element & child across all pages has a strictly unique ID
+        for page_data in doc_json.get("pages", []):
+            seen_ids = set()
+            max_id = 0
+            def find_max(node):
+                nonlocal max_id
+                cid = node.get("id")
+                if isinstance(cid, int) and cid > max_id:
+                    max_id = cid
+                elif isinstance(cid, str) and cid.isdigit() and int(cid) > max_id:
+                    max_id = int(cid)
+                for k in node.get("kids", []):
+                    find_max(k)
+
+            for el in page_data.get("elements", []):
+                find_max(el)
+
+            next_id = max(max_id + 1, 1000)
+            def dedup_node(node):
+                nonlocal next_id
+                cid = str(node.get("id")) if node.get("id") is not None else None
+                if cid is None or cid in seen_ids:
+                    node["id"] = next_id
+                    seen_ids.add(str(next_id))
+                    next_id += 1
+                else:
+                    seen_ids.add(cid)
+                for k in node.get("kids", []):
+                    dedup_node(k)
+
+            for el in page_data.get("elements", []):
+                dedup_node(el)
 
         # Determine whether PDF is born-digital or scanned
         total_text = sum(len(p.get_text()) for p in fitz_doc)
@@ -403,15 +438,16 @@ class TaggingService:
             for el in els:
                 stats["elements_count"] += 1
                 t = str(el.get("type", "")).lower()
-                if "heading" in t:
+                tg = str(el.get("tag", "")).upper()
+                if "heading" in t or tg.startswith("H"):
                     stats["headings_count"] += 1
-                elif "paragraph" in t:
+                elif "paragraph" in t or tg == "P":
                     stats["paragraphs_count"] += 1
-                elif "figure" in t:
+                elif "figure" in t or tg == "FIGURE":
                     stats["figures_count"] += 1
-                elif "list" in t:
+                elif t in ("list", "ordered_list", "unordered_list") or tg == "L":
                     stats["lists_count"] += 1
-                elif "table" in t:
+                elif t == "table" or tg == "TABLE":
                     stats["tables_count"] += 1
                 if el.get("kids"):
                     count_stat_elements(el["kids"])

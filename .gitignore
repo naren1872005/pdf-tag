@@ -95,3 +95,5 @@ Thumbs.db
 Alternative_OCR/
 # Runtime uploads and generated PDF outputs
 workspace_web/
+
+config/gemini_config.json

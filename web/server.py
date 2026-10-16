@@ -9,6 +9,7 @@ from typing import Dict, Any, Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from core.remediator import TaggingService
 
@@ -93,6 +94,11 @@ def process_pdf_worker(task_id: str):
     try:
         task["status"] = "processing"
         task["logs"].append("Starting automated PDF accessibility remediation...")
+        from core.gemini_service import GeminiService
+        if GeminiService.is_enabled():
+            task["logs"].append("Gemini AI is active: Unifying formulas, paragraphs & generating intelligent Alt-Text...")
+        else:
+            task["logs"].append("Running with local deterministic accessibility engine.")
         save_task_meta(task)
 
         result = TaggingService.remediate_pdf(
@@ -112,6 +118,8 @@ def process_pdf_worker(task_id: str):
         task["logs"].append("Tagged PDF successfully exported with StructTreeRoot and ParentTree.")
         save_task_meta(task)
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         task["status"] = "error"
         task["error_message"] = str(e)
         task["logs"].append(f"Error during tagging: {e}")
@@ -135,10 +143,47 @@ async def serve_index():
     return "<h1>TagPilot Web</h1><p>Static index.html not found</p>"
 
 
+class GeminiKeyPayload(BaseModel):
+    api_key: str
+
+
+@app.get("/api/gemini/status")
+async def get_gemini_status():
+    from core.gemini_service import GeminiService
+    return GeminiService.get_status()
+
+
+@app.post("/api/gemini/key")
+async def save_gemini_key(payload: GeminiKeyPayload):
+    from core.gemini_service import GeminiService
+    clean_k = GeminiService._clean_key_string(payload.api_key)
+    masked = f"{clean_k[:4]}...{clean_k[-4:]}" if len(clean_k) > 8 else "***"
+    print(f"[Gemini Key] Received key for validation: {masked}")
+    success, msg = GeminiService.set_api_key(payload.api_key)
+    print(f"[Gemini Key] Result: success={success}, msg={msg}")
+    if not success:
+        raise HTTPException(status_code=400, detail=msg)
+    return {"success": True, "message": msg, "status": GeminiService.get_status()}
+
+
+@app.delete("/api/gemini/key")
+async def remove_gemini_key():
+    from core.gemini_service import GeminiService
+    GeminiService.remove_api_key()
+    return {"success": True, "message": "Gemini API key removed.", "status": GeminiService.get_status()}
+
+
 @app.post("/api/upload")
 async def upload_pdf(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
+    from core.gemini_service import GeminiService
+    if not GeminiService.is_enabled():
+        raise HTTPException(
+            status_code=400,
+            detail="Gemini API Key is mandatory for PDF accessibility tagging. Please connect and verify your Gemini API key in settings before uploading."
+        )
 
     task_id = str(uuid.uuid4())[:8]
     task_dir = UPLOADS_DIR / task_id

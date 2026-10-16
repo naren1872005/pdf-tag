@@ -267,31 +267,19 @@ class SpanEnforcer:
         return li
 
     # -------------------------------------------------------------------------
-    # Paragraph Spans: Labels, Split Words, Standalone Lines, Underlined Text
+    # Paragraph Spans: Only for genuine inline requirements (hyphenated split words, form fields)
     # -------------------------------------------------------------------------
     def _enforce_paragraph_spans(self, el: dict, page_underlines: List[Any], page_num: int) -> dict:
         content = (el.get("content") or "").strip()
         if not content:
             return el
 
-        # 5. Underlined Text Check
-        spans_meta = el.get("_spans_meta") or []
-        has_underline = el.get("underline") or any(s.get("underline") for s in spans_meta)
-        if not has_underline and page_underlines:
-            bbox = el.get("bounding_box")
-            if bbox and len(bbox) == 4:
-                # Check intersection with page_underlines
-                # Note: page_underlines are in displayed fitz coordinates
-                for ur in page_underlines:
-                    # PDF coordinates: [x0, y0, x1, y1]
-                    if ur.x0 <= bbox[2] + 2 and ur.x1 >= bbox[0] - 2:
-                        has_underline = True
-                        break
+        # 1. Words Split Across Lines with Hyphen (e.g. "accessi-" followed by "bility")
+        split_match = self.HYPHEN_SPLIT_RE.search(content)
+        if split_match:
+            return self._build_split_word_spans(el, content, split_match)
 
-        if has_underline:
-            return self._build_underlined_spans(el, content)
-
-        # 2. Field Label Detection (e.g. "Name: John Smith", "Date: October 14, 2026")
+        # 2. Genuine Form Field Labels (e.g. "Name: John", "Date: 2026-10-15")
         label_match = self.LABEL_RE.match(content)
         if label_match:
             label_part = label_match.group(1).strip()
@@ -299,33 +287,16 @@ class SpanEnforcer:
             if self._is_genuine_label(label_part, value_part):
                 return self._build_label_value_spans(el, label_part, value_part)
 
-        # 3. Words Split Across Lines (e.g. "accessi-" followed by "bility")
-        split_match = self.HYPHEN_SPLIT_RE.search(content)
-        if split_match:
-            return self._build_split_word_spans(el, content, split_match)
-
-        # 4. Standalone Lines & Line breaks requiring inline grouping
-        if "\n" in content:
-            lines = [line.strip() for line in content.split("\n") if line.strip()]
-            if len(lines) >= 2:
-                return self._build_multiline_spans(el, lines)
-        elif el.get("is_standalone_line") or el.get("standalone"):
-            return self._build_standalone_span(el, content)
-
+        # Plain paragraphs must hold text directly: NEVER wrap normal paragraphs in redundant Span tags!
         return el
 
     def _is_genuine_label(self, label_part: str, value_part: str) -> bool:
         if not value_part:
             return False
-        words = label_part.split()
-        if len(words) < 1 or len(words) > 4:
-            return False
-        if label_part.lower() in self.PROSE_STARTS:
-            return False
-        # Avoid bible verses (e.g. "John 3: 16") or pure time (e.g. "12: 30")
-        if re.match(r'^\d+:\s*\d+$', f"{label_part} {value_part}"):
-            return False
-        return True
+        lp = label_part.lower().rstrip(':').strip()
+        # Only true form metadata / field keys
+        FORM_LABELS = {"name", "date", "signature", "signed", "ssn", "phone", "email", "address", "department", "company"}
+        return lp in FORM_LABELS
 
     def _build_label_value_spans(self, el: dict, label_part: str, value_part: str) -> dict:
         span_lbl_id = self._new_id(el["id"], "lbl")

@@ -320,8 +320,8 @@ class PageRenderer:
 
             if el_type not in ("table", "table_row", "table_header_cell", "table_data_cell") and el.get("kids"):
                 has_span_or_text_kids = any(
-                    k.get("type") in ("span", "Span", "paragraph", "reference", "link", "hyperlink") or
-                    (get_tag_fn and get_tag_fn(k.get("type"), k) in ("Span", "P", "Link", "Reference"))
+                    k.get("type") in ("span", "Span", "paragraph", "reference", "link", "hyperlink", "formula", "Formula") or
+                    (get_tag_fn and get_tag_fn(k.get("type"), k) in ("Span", "P", "Link", "Reference", "Formula"))
                     for k in el["kids"]
                 )
                 if has_span_or_text_kids:
@@ -400,8 +400,16 @@ class PageRenderer:
                 
             el_id = str(el.get("id", mcid_counter))
             
-            if is_digital and el_id in digital_tagged_mcids:
-                mcids_list = digital_tagged_mcids[el_id]
+            mcids_list = None
+            if is_digital and digital_tagged_mcids:
+                if el_id in digital_tagged_mcids:
+                    mcids_list = digital_tagged_mcids[el_id]
+                elif el_id.endswith("-P") and el_id[:-2] in digital_tagged_mcids:
+                    mcids_list = digital_tagged_mcids[el_id[:-2]]
+                elif f"{el_id}-P" in digital_tagged_mcids:
+                    mcids_list = digital_tagged_mcids[f"{el_id}-P"]
+
+            if is_digital and mcids_list is not None:
                 render_results.append(RenderResult(
                     object_id=el_id,
                     page=page_num,

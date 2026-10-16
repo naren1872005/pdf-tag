@@ -54,6 +54,15 @@ if (browseBtn) {
   });
 });
 
+uploadCard.addEventListener('click', (e) => {
+  if (!geminiEnabled) {
+    e.preventDefault();
+    e.stopPropagation();
+    openGeminiModalDialog();
+    showGeminiMsg('Google Gemini API Key is mandatory. Please enter and verify your key to proceed.', 'error');
+  }
+});
+
 uploadCard.addEventListener('drop', (e) => {
   const dt = e.dataTransfer;
   const files = dt.files;
@@ -69,6 +78,14 @@ fileInput.addEventListener('change', (e) => {
 });
 
 async function handleFileUpload(file) {
+  if (!geminiEnabled) {
+    alert('Google Gemini API Key is mandatory! Please configure and verify a valid Gemini API Key before uploading.');
+    openGeminiModalDialog();
+    showGeminiMsg('Google Gemini API Key is mandatory. Please enter and verify your key to proceed.', 'error');
+    if (fileInput) fileInput.value = '';
+    return;
+  }
+
   if (!file.name.toLowerCase().endsWith('.pdf')) {
     alert('Please upload a valid PDF document.');
     return;
@@ -77,6 +94,14 @@ async function handleFileUpload(file) {
   uploadCard.style.display = 'none';
   progressCard.style.display = 'block';
   resultsCard.style.display = 'none';
+
+  const progressTitle = document.querySelector('#progress-card .progress-title-block h3');
+  if (progressTitle) {
+    progressTitle.innerText = 'Automated Remediation in Progress';
+    progressTitle.style.color = '';
+  }
+  progressBarFill.style.background = '';
+  progressPercent.style.color = '';
 
   updateStepState(1, 'active');
   progressBarFill.style.width = '10%';
@@ -173,6 +198,13 @@ async function checkStatus() {
       loadResults();
     } else if (data.status === 'error') {
       clearInterval(pollInterval);
+      const progressTitle = document.querySelector('#progress-card .progress-title-block h3');
+      if (progressTitle) {
+        progressTitle.innerText = 'Remediation Failed';
+        progressTitle.style.color = '#ef4444';
+      }
+      progressBarFill.style.background = '#ef4444';
+      progressPercent.style.color = '#ef4444';
       progressStageMsg.innerText = `Pipeline failed: ${data.error_message || 'Unknown error'}`;
       logMessage(`[ERROR] ${data.error_message}`);
       const retryBlock = document.getElementById('progress-retry-block');
@@ -190,6 +222,13 @@ if (retryBtn) {
     fileInput.value = '';
     progressCard.style.display = 'none';
     uploadCard.style.display = 'block';
+    const progressTitle = document.querySelector('#progress-card .progress-title-block h3');
+    if (progressTitle) {
+      progressTitle.innerText = 'Automated Remediation in Progress';
+      progressTitle.style.color = '';
+    }
+    progressBarFill.style.background = '';
+    progressPercent.style.color = '';
     const retryBlock = document.getElementById('progress-retry-block');
     if (retryBlock) retryBlock.style.display = 'none';
   });
@@ -321,8 +360,15 @@ function renderAllPagesFeed() {
   });
 }
 
+function getElementDomKey(pNum, el) {
+  const page = pNum || 1;
+  const idVal = (el && el.id != null) ? el.id : (el && (el.uuid || el.node_id) ? (el.uuid || el.node_id) : 'el');
+  return `${page}-${idVal}`;
+}
+
 function drawPageBoundingBoxes(pageData, imgEl, svgEl) {
   svgEl.innerHTML = '';
+  const pNum = pageData.page_number || 1;
   const allElements = [];
   function collect(els) {
     (els || []).forEach(el => {
@@ -356,11 +402,19 @@ function drawPageBoundingBoxes(pageData, imgEl, svgEl) {
     const b = el.bounding_box;
     if (!b || b.length !== 4) return;
 
+    // If this is a wrapper P whose only child is a Formula, skip drawing duplicate wrapper rect
+    // so the Formula rect with distinct formula styling is directly visible and interactive
+    if (el.tag === 'P' && el.kids && el.kids.length === 1 && (el.kids[0].tag === 'Formula' || el.kids[0].type === 'formula')) {
+      return;
+    }
+
     // PDF coords (bottom-up): [x0, y0, x1, y1]
     const x = b[0] * scaleX;
     const w = (b[2] - b[0]) * scaleX;
     const y = (maxPdfY - b[3]) * scaleY;
     const h = (b[3] - b[1]) * scaleY;
+
+    const elKey = getElementDomKey(pNum, el);
 
     const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
     rect.setAttribute('x', x);
@@ -368,16 +422,19 @@ function drawPageBoundingBoxes(pageData, imgEl, svgEl) {
     rect.setAttribute('width', Math.max(w, 4));
     rect.setAttribute('height', Math.max(h, 4));
     rect.setAttribute('rx', '2');
-    rect.setAttribute('id', `bbox-node-${el.id}`);
+    rect.setAttribute('id', `bbox-node-${elKey}`);
     rect.setAttribute('class', `bbox-rect tag-${getTagColorClass(el)}`);
     rect.style.fill = 'rgba(99, 102, 241, 0.12)';
     rect.style.stroke = getTagStrokeColor(el);
     rect.style.strokeWidth = '1.5';
     rect.style.cursor = 'pointer';
 
-    rect.addEventListener('mouseenter', () => highlightElement(el.id));
-    rect.addEventListener('mouseleave', () => unhighlightElement(el.id));
-    rect.addEventListener('click', () => scrollToTreeNode(el.id));
+    rect.addEventListener('mouseenter', () => highlightElement(elKey));
+    rect.addEventListener('mouseleave', () => unhighlightElement(elKey));
+    rect.addEventListener('click', (e) => {
+      e.stopPropagation();
+      scrollToTreeNode(elKey);
+    });
 
     svgEl.appendChild(rect);
   });
@@ -548,6 +605,11 @@ function getElementSummaryText(el) {
     return el.alt_text || 'Figure (Image)';
   }
 
+  // For Formula
+  if (tag === 'FORMULA' || el.type === 'formula') {
+    return el.content || el.alt_text || 'Formula';
+  }
+
   // If node has kids, concatenate a preview of text
   if (el.kids && el.kids.length > 0) {
     if (tag === 'LBL' || el.type === 'list_label') {
@@ -569,9 +631,10 @@ function getElementSummaryText(el) {
 }
 
 function renderElementTreeNode(el, pNum, container) {
+  const elKey = getElementDomKey(pNum, el);
   const nodeEl = document.createElement('div');
   nodeEl.className = 'tree-node';
-  nodeEl.id = `tree-node-${el.id}`;
+  nodeEl.id = `tree-node-${elKey}`;
   nodeEl.dataset.page = pNum;
 
   const itemEl = document.createElement('div');
@@ -591,11 +654,11 @@ function renderElementTreeNode(el, pNum, container) {
     ${displayContent ? `<span class="tree-content" title="${escapeHtml(tooltipText)}">${escapeHtml(displayContent)}</span>` : ''}
   `;
 
-  itemEl.addEventListener('mouseenter', () => highlightElement(el.id));
-  itemEl.addEventListener('mouseleave', () => unhighlightElement(el.id));
+  itemEl.addEventListener('mouseenter', () => highlightElement(elKey));
+  itemEl.addEventListener('mouseleave', () => unhighlightElement(elKey));
   itemEl.addEventListener('click', (e) => {
     e.stopPropagation();
-    scrollToBBox(el.id, pNum);
+    scrollToBBox(elKey, pNum);
   });
 
   nodeEl.appendChild(itemEl);
@@ -613,17 +676,18 @@ function renderElementTreeNode(el, pNum, container) {
 // --------------------------------------------------------------------------
 // Page-Anchored Synchronized Scrolling (Left <-> Right)
 // --------------------------------------------------------------------------
-function setupSynchronizedScrolling() {
-  let activePanel = null; // 'left' | 'right' | null
-  let idleTimer = null;
+let activePanel = null; // 'left' | 'right' | null
+let idleTimer = null;
 
-  function setActivePanel(panel) {
-    activePanel = panel;
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      activePanel = null;
-    }, 200);
-  }
+function setActivePanel(panel, delay = 250) {
+  activePanel = panel;
+  if (idleTimer) clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    activePanel = null;
+  }, delay);
+}
+
+function setupSynchronizedScrolling() {
 
   // Pointer & Wheel listeners to track which panel user is interacting with
   pdfScrollContainer.addEventListener('mouseenter', () => { activePanel = 'left'; });
@@ -704,6 +768,7 @@ function getTagDisplayLabel(el) {
   const t = el.type || '';
   if (t === 'heading') return `H${el.heading_level || 1}`;
   if (t === 'paragraph') return 'P';
+  if (t === 'formula') return 'Formula';
   if (t === 'list') return 'L';
   if (t === 'list_item') return 'LI';
   if (t === 'list_label') return 'Lbl';
@@ -723,6 +788,7 @@ function getTagColorClass(el) {
     return tg.toLowerCase();
   }
   if (tg === 'P') return 'p';
+  if (tg === 'FORMULA') return 'formula';
   if (tg === 'L' || tg === 'LI' || tg === 'LBL' || tg === 'LBODY') return 'li';
   if (tg === 'FIGURE') return 'figure';
   if (tg === 'TABLE' || tg === 'TR' || tg === 'TH' || tg === 'TD') return 'table';
@@ -731,6 +797,7 @@ function getTagColorClass(el) {
   const t = el.type || '';
   if (t === 'heading') return `h${el.heading_level || 1}`;
   if (t === 'paragraph') return 'p';
+  if (t === 'formula') return 'formula';
   if (t === 'list' || t === 'list_item' || t === 'list_label' || t === 'list_body') return 'li';
   if (t === 'figure') return 'figure';
   if (t === 'table' || t === 'table_row' || t === 'table_header_cell' || t === 'table_data_cell') return 'table';
@@ -744,6 +811,7 @@ function getTagStrokeColor(el) {
   if (label === 'H2') return '#3b82f6';
   if (label === 'H3' || label.startsWith('H')) return '#06b6d4';
   if (label === 'P') return '#818cf8';
+  if (label === 'FORMULA') return '#ec4899';
   if (label === 'L' || label === 'LI' || label === 'LBL' || label === 'LBODY') return '#10b981';
   if (label === 'FIGURE') return '#f43f5e';
   if (label === 'TABLE' || label === 'TR' || label === 'TH' || label === 'TD') return '#fb923c';
@@ -751,47 +819,119 @@ function getTagStrokeColor(el) {
   return '#94a3b8';
 }
 
-function highlightElement(id) {
-  const bbox = document.getElementById(`bbox-node-${id}`);
-  if (bbox) {
-    bbox.style.strokeWidth = '3.5';
-    bbox.style.fill = 'rgba(99, 102, 241, 0.4)';
+function clearAllSelections() {
+  document.querySelectorAll('.tree-item.selected-tree-item').forEach(el => {
+    el.classList.remove('selected-tree-item');
+    el.classList.remove('highlighted');
+  });
+  document.querySelectorAll('.bbox-rect.selected-bbox').forEach(b => {
+    b.classList.remove('selected-bbox');
+    b.style.strokeWidth = '1.5';
+    b.style.fill = 'rgba(99, 102, 241, 0.12)';
+  });
+}
+
+function getResolvedBBox(elKey) {
+  let bbox = document.getElementById(`bbox-node-${elKey}`);
+  if (!bbox && elKey.endsWith('-P')) {
+    bbox = document.getElementById(`bbox-node-${elKey.slice(0, -2)}`);
   }
-  const treeItem = document.querySelector(`#tree-node-${id} .tree-item`);
-  if (treeItem) {
-    treeItem.classList.add('highlighted');
+  return bbox;
+}
+
+function highlightElement(elKey) {
+  const bbox = getResolvedBBox(elKey);
+  if (bbox && !bbox.classList.contains('selected-bbox')) {
+    bbox.style.strokeWidth = '3.5';
+    bbox.style.fill = 'rgba(99, 102, 241, 0.35)';
+  }
+  const treeNode = document.getElementById(`tree-node-${elKey}`);
+  if (treeNode) {
+    const treeItem = treeNode.querySelector('.tree-item');
+    if (treeItem && !treeItem.classList.contains('selected-tree-item')) {
+      treeItem.classList.add('highlighted');
+    }
   }
 }
 
-function unhighlightElement(id) {
-  const bbox = document.getElementById(`bbox-node-${id}`);
-  if (bbox) {
+function unhighlightElement(elKey) {
+  const bbox = getResolvedBBox(elKey);
+  if (bbox && !bbox.classList.contains('selected-bbox')) {
     bbox.style.strokeWidth = '1.5';
     bbox.style.fill = 'rgba(99, 102, 241, 0.12)';
   }
-  const treeItem = document.querySelector(`#tree-node-${id} .tree-item`);
-  if (treeItem) {
-    treeItem.classList.remove('highlighted');
+  const treeNode = document.getElementById(`tree-node-${elKey}`);
+  if (treeNode) {
+    const treeItem = treeNode.querySelector('.tree-item');
+    if (treeItem && !treeItem.classList.contains('selected-tree-item')) {
+      treeItem.classList.remove('highlighted');
+    }
   }
 }
 
-function scrollToTreeNode(id) {
-  const nodeEl = document.getElementById(`tree-node-${id}`);
-  if (nodeEl) {
-    nodeEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    highlightElement(id);
-  }
-}
+function scrollToTreeNode(elKey) {
+  setActivePanel('left', 800);
+  clearAllSelections();
 
-function scrollToBBox(id, pageNum) {
-  const bbox = document.getElementById(`bbox-node-${id}`);
+  const nodeEl = document.getElementById(`tree-node-${elKey}`);
+  if (nodeEl && tagsScrollContainer) {
+    const containerRect = tagsScrollContainer.getBoundingClientRect();
+    const nodeRect = nodeEl.getBoundingClientRect();
+    const targetScrollTop = tagsScrollContainer.scrollTop + (nodeRect.top - containerRect.top) - (containerRect.height / 2) + (nodeRect.height / 2);
+    tagsScrollContainer.scrollTo({
+      top: Math.max(0, targetScrollTop),
+      behavior: 'smooth'
+    });
+    const treeItem = nodeEl.querySelector('.tree-item');
+    if (treeItem) {
+      treeItem.classList.add('selected-tree-item');
+      treeItem.classList.add('highlighted');
+    }
+  }
+
+  const bbox = getResolvedBBox(elKey);
   if (bbox) {
-    bbox.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    highlightElement(id);
+    bbox.classList.add('selected-bbox');
+    bbox.style.strokeWidth = '3.5';
+    bbox.style.fill = 'rgba(99, 102, 241, 0.45)';
+  }
+}
+
+function scrollToBBox(elKey, pageNum) {
+  setActivePanel('right', 800);
+  clearAllSelections();
+
+  const bbox = getResolvedBBox(elKey);
+  if (bbox && pdfScrollContainer) {
+    const containerRect = pdfScrollContainer.getBoundingClientRect();
+    const bboxRect = bbox.getBoundingClientRect();
+    const targetScrollTop = pdfScrollContainer.scrollTop + (bboxRect.top - containerRect.top) - (containerRect.height / 2) + (bboxRect.height / 2);
+    pdfScrollContainer.scrollTo({
+      top: Math.max(0, targetScrollTop),
+      behavior: 'smooth'
+    });
+    bbox.classList.add('selected-bbox');
+    bbox.style.strokeWidth = '3.5';
+    bbox.style.fill = 'rgba(99, 102, 241, 0.45)';
   } else {
     const pageCard = document.getElementById(`page-card-${pageNum}`);
-    if (pageCard) {
-      pageCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    if (pageCard && pdfScrollContainer) {
+      const containerRect = pdfScrollContainer.getBoundingClientRect();
+      const cardRect = pageCard.getBoundingClientRect();
+      const targetScrollTop = pdfScrollContainer.scrollTop + (cardRect.top - containerRect.top) - 20;
+      pdfScrollContainer.scrollTo({
+        top: Math.max(0, targetScrollTop),
+        behavior: 'smooth'
+      });
+    }
+  }
+
+  const nodeEl = document.getElementById(`tree-node-${elKey}`);
+  if (nodeEl) {
+    const treeItem = nodeEl.querySelector('.tree-item');
+    if (treeItem) {
+      treeItem.classList.add('selected-tree-item');
+      treeItem.classList.add('highlighted');
     }
   }
 }
@@ -818,6 +958,7 @@ function escapeHtml(str) {
 }
 
 window.addEventListener('DOMContentLoaded', () => {
+  checkGeminiStatus();
   const params = new URLSearchParams(window.location.search);
   const taskFromParam = params.get('task') || window.location.hash.replace('#', '').trim();
   if (taskFromParam) {
@@ -828,3 +969,164 @@ window.addEventListener('DOMContentLoaded', () => {
     checkStatus();
   }
 });
+
+// --------------------------------------------------------------------------
+// Gemini AI Key Modal & Integration
+// --------------------------------------------------------------------------
+const geminiKeyBtn = document.getElementById('gemini-key-btn');
+const geminiBtnText = document.getElementById('gemini-btn-text');
+const geminiStatusPill = document.getElementById('gemini-status-pill');
+
+const summaryGeminiBtn = document.getElementById('summary-gemini-btn');
+const summaryGeminiBtnText = document.getElementById('summary-gemini-btn-text');
+const summaryGeminiStatusPill = document.getElementById('summary-gemini-status-pill');
+
+const geminiModal = document.getElementById('gemini-modal');
+const closeGeminiModal = document.getElementById('close-gemini-modal');
+const cancelGeminiBtn = document.getElementById('cancel-gemini-btn');
+const saveGeminiKeyBtn = document.getElementById('save-gemini-key-btn');
+const removeGeminiKeyBtn = document.getElementById('remove-gemini-key-btn');
+const geminiApiKeyInput = document.getElementById('gemini-api-key-input');
+const toggleKeyVisibility = document.getElementById('toggle-key-visibility');
+const geminiStatusMsg = document.getElementById('gemini-status-msg');
+
+let geminiEnabled = false;
+
+async function checkGeminiStatus() {
+  try {
+    const res = await fetch('/api/gemini/status');
+    const data = await res.json();
+    geminiEnabled = data.enabled;
+    updateGeminiUI(data);
+    if (!geminiEnabled && !currentTaskId) {
+      setTimeout(() => {
+        openGeminiModalDialog();
+        showGeminiMsg('Google Gemini API Key is mandatory. Please enter and verify your key to proceed.', 'error');
+      }, 300);
+    }
+  } catch (err) {
+    console.error('Failed to check Gemini status:', err);
+  }
+}
+
+function updateGeminiUI(data) {
+  const isOnline = !!data.enabled;
+  const count = data.key_count || (isOnline ? 1 : 0);
+  const label = isOnline ? (count > 1 ? `Gemini (${count} Keys)` : 'Gemini AI') : 'Gemini API Key';
+  const pillText = isOnline ? 'Active' : 'Offline';
+  const pillClass = isOnline ? 'gemini-status-pill online' : 'gemini-status-pill offline';
+
+  if (geminiKeyBtn) {
+    geminiKeyBtn.classList.toggle('active', isOnline);
+    if (geminiBtnText) geminiBtnText.innerText = isOnline ? 'Gemini AI' : 'Add Gemini Key';
+    if (geminiStatusPill) {
+      geminiStatusPill.innerText = pillText;
+      geminiStatusPill.className = pillClass;
+    }
+  }
+
+  if (summaryGeminiBtn) {
+    summaryGeminiBtn.classList.toggle('active', isOnline);
+    if (summaryGeminiBtnText) summaryGeminiBtnText.innerText = label;
+    if (summaryGeminiStatusPill) {
+      summaryGeminiStatusPill.innerText = pillText;
+      summaryGeminiStatusPill.className = pillClass;
+    }
+  }
+
+  if (removeGeminiKeyBtn) removeGeminiKeyBtn.style.display = isOnline ? 'block' : 'none';
+}
+
+function openGeminiModalDialog() {
+  geminiModal.classList.add('open');
+  geminiStatusMsg.style.display = 'none';
+  geminiStatusMsg.className = 'gemini-status-msg';
+  geminiApiKeyInput.value = '';
+  setTimeout(() => {
+    geminiApiKeyInput.focus();
+  }, 50);
+}
+
+function closeGeminiModalDialog() {
+  geminiModal.classList.remove('open');
+  geminiStatusMsg.style.display = 'none';
+}
+
+if (geminiKeyBtn) geminiKeyBtn.addEventListener('click', openGeminiModalDialog);
+if (summaryGeminiBtn) summaryGeminiBtn.addEventListener('click', openGeminiModalDialog);
+if (closeGeminiModal) closeGeminiModal.addEventListener('click', closeGeminiModalDialog);
+if (cancelGeminiBtn) cancelGeminiBtn.addEventListener('click', closeGeminiModalDialog);
+
+if (geminiModal) {
+  geminiModal.addEventListener('click', (e) => {
+    if (e.target === geminiModal) closeGeminiModalDialog();
+  });
+}
+
+if (toggleKeyVisibility) {
+  toggleKeyVisibility.addEventListener('click', () => {
+    const isPass = geminiApiKeyInput.type === 'password';
+    geminiApiKeyInput.type = isPass ? 'text' : 'password';
+    toggleKeyVisibility.innerText = isPass ? '🔒' : '👁️';
+  });
+}
+
+if (saveGeminiKeyBtn) {
+  saveGeminiKeyBtn.addEventListener('click', async () => {
+    const key = geminiApiKeyInput.value.trim();
+    if (!key) {
+      showGeminiMsg('Please enter or paste your Gemini API key.', 'error');
+      return;
+    }
+
+    saveGeminiKeyBtn.disabled = true;
+    saveGeminiKeyBtn.innerHTML = '<span class="spinner"></span> <span>Verifying...</span>';
+    showGeminiMsg('Testing connection to Google Gemini API...', '');
+
+    try {
+      const res = await fetch('/api/gemini/key', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ api_key: key })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || data.message || 'Verification failed.');
+      }
+
+      showGeminiMsg(data.message || 'Connected successfully!', 'success');
+      updateGeminiUI(data.status);
+      setTimeout(() => {
+        closeGeminiModalDialog();
+      }, 1200);
+    } catch (err) {
+      showGeminiMsg(err.message, 'error');
+    } finally {
+      saveGeminiKeyBtn.disabled = false;
+      saveGeminiKeyBtn.innerHTML = '<span>Connect &amp; Save</span>';
+    }
+  });
+}
+
+if (removeGeminiKeyBtn) {
+  removeGeminiKeyBtn.addEventListener('click', async () => {
+    if (!confirm('Are you sure you want to remove the Gemini API key?')) return;
+    try {
+      const res = await fetch('/api/gemini/key', { method: 'DELETE' });
+      const data = await res.json();
+      updateGeminiUI(data.status);
+      closeGeminiModalDialog();
+    } catch (err) {
+      alert('Failed to remove key: ' + err.message);
+    }
+  });
+}
+
+function showGeminiMsg(msg, type) {
+  geminiStatusMsg.innerText = msg;
+  geminiStatusMsg.className = `gemini-status-msg ${type}`;
+  geminiStatusMsg.style.display = 'block';
+}
+
+// Check and sync Gemini AI status on page load
+checkGeminiStatus();

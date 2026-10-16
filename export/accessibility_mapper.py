@@ -11,6 +11,7 @@ class AccessibilityMapper:
         "table_header_cell": "TH",
         "table_data_cell": "TD",
         "formula": "Formula",
+        "Formula": "Formula",
         "hyperlink": "Link",
         "footnote_reference": "Reference",
         "footnote_note": "Note",
@@ -45,7 +46,7 @@ class AccessibilityMapper:
         explicit_tags = {
             "Artifact", "Document", "Part", "Sect", "Div", "Art",
             "P", "H1", "H2", "H3", "H4", "H5", "H6", "H",
-            "LI", "LBody", "Table", "TR", "TH", "TD", "Figure",
+            "LI", "LBody", "Table", "TR", "TH", "TD", "Figure", "Formula",
             "Caption", "Form", "Link", "Note", "Reference", "L", "Lbl",
             "TOC", "TOCI", "OBJR", "Span"
         }

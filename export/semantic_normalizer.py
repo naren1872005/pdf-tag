@@ -39,6 +39,9 @@ class SemanticNormalizer:
                     current_list_items.clear()
             
             for el in elements:
+                # Filter out ghost empty elements
+                if not (el.get("content") or "").strip() and not el.get("kids") and el.get("type") not in ("figure", "table"):
+                    continue
                 el_type = el.get("type")
                 if el_type == "table":
                     self._normalize_table(el)
@@ -46,6 +49,22 @@ class SemanticNormalizer:
                 if el_type == "list_item":
                     self._normalize_list_item(el)
                     current_list_items.append(el)
+                    continue
+                elif el_type == "formula" or el.get("tag") == "Formula":
+                    flush_list()
+                    f_id = el.get("id")
+                    p_wrap = {
+                        "id": f"{f_id}-P" if f_id is not None else None,
+                        "type": "paragraph",
+                        "tag": "P",
+                        "content": el.get("content") or el.get("text") or "",
+                        "alt_text": el.get("alt_text") or "",
+                        "bounding_box": el.get("bounding_box"),
+                        "reading_order": el.get("reading_order"),
+                        "kids": [el],
+                        "confidence": 1.0
+                    }
+                    normalized_elements.append(p_wrap)
                     continue
                 else:
                     flush_list()

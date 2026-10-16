@@ -89,7 +89,7 @@ class StructTreeBuilder:
         
         sect_elem = pdf.make_indirect(Dictionary(
             Type=Name("/StructElem"),
-            S=Name("/Sect"),
+            S=Name("/Art"),
             P=doc_elem,
             K=Array()
         ))
@@ -461,6 +461,10 @@ class StructTreeBuilder:
                 
             el_id = el.get("id")
             mcid = id_to_mcid.get(str(el_id))
+            if mcid is None and str(el_id).endswith("-P"):
+                mcid = id_to_mcid.get(str(el_id)[:-2])
+            if mcid is None and el_id is not None:
+                mcid = id_to_mcid.get(f"{el_id}-P")
             
             elem_dict = pdf.make_indirect(Dictionary(
                 Type=Name("/StructElem"),
@@ -474,9 +478,9 @@ class StructTreeBuilder:
             if el_id is not None:
                 elem_dict[NODE_KEY] = pikepdf.String(f"node_{el_id}")
             
-            # Alt only when real alternate text was supplied (no generic placeholder)
-            _alt = (el.get("alt_text") or "").strip() if el_type == "figure" else ""
-            if _alt and _alt.lower() not in GENERIC_ALT:
+            # Alt when alternate text was supplied (Figures and Formulas ONLY)
+            _alt = (el.get("alt_text") or el.get("Alt") or "").strip()
+            if _alt and _alt.lower() not in GENERIC_ALT and tag in ("Figure", "Formula"):
                 elem_dict.Alt = pikepdf.String(_alt)
 
             if el.get("actual_text"):
@@ -493,7 +497,7 @@ class StructTreeBuilder:
             # Determine block-level context based on parent tag
             parent_s = parent_elem.get("/S")
             parent_tag = str(parent_s) if parent_s else ""
-            is_block_context = parent_tag in ["/Document", "/Part", "/Sect", "/Div", "/TD", "/TH"]
+            is_block_context = parent_tag in ["/Document", "/Part", "/Art", "/Sect", "/Div", "/TD", "/TH"]
                 
             if tag == "Note":
                 if is_block_context:
@@ -526,6 +530,13 @@ class StructTreeBuilder:
                 elem_dict.A = pdf.make_indirect(Dictionary(O=Name("/Table")))
                 StructTreeBuilder._apply_bbox(pdf, elem_dict, current_page, el.get("bounding_box"), "Table")
                 
+            if tag == "Formula":
+                StructTreeBuilder._apply_bbox(pdf, elem_dict, current_page, el.get("bounding_box"), "Formula")
+                if is_block_context:
+                    if "/A" not in elem_dict:
+                        elem_dict.A = pdf.make_indirect(Dictionary(O=Name("/Layout")))
+                    elem_dict.A.Placement = Name("/Block")
+
             if tag in ("TR", "TD", "TH", "L", "LI", "LBody", "Lbl", "TOC", "TOCI", "Reference"):
                 StructTreeBuilder._apply_bbox(pdf, elem_dict, current_page, el.get("bounding_box"), tag)
 

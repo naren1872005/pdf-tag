@@ -173,7 +173,12 @@ class StructureEnforcer:
             if isinstance(res, list):
                 fixed_kids.extend(res)
             elif res is not None:
-                fixed_kids.append(res)
+                if parent is None and (_type(res) == "formula" or res.get("tag") == "Formula"):
+                    wrapped_p = self._make("paragraph", res, "P", kids=[res], content=res.get("content") or "")
+                    wrapped_p["alt_text"] = res.get("alt_text") or res.get("content") or ""
+                    fixed_kids.append(wrapped_p)
+                else:
+                    fixed_kids.append(res)
         ptype = _type(parent) if parent is not None else ""
         # Group orphan list items / TOC entries that are not under their container
         if ptype not in LIST_TYPES:
@@ -673,6 +678,27 @@ class StructureEnforcer:
         # 3. If <= 2 cells and all contain long multi-sentence prose paragraphs
         if len(real_cells) <= 2 and all(len((c.get("content") or "").split()) > 15 or bool(c.get("kids")) for c in real_cells):
             return True
+
+        # 4. Check for section header patterns, callout headers, calculator screens, or narrative prose in cells
+        for c in real_cells:
+            cnt = (c.get("content") or "").strip()
+            if re.search(r'^\s*(?:SECTION|CHAPTER|UNIT|MODULE|LESSON|APPENDIX|PART)\s+\d+', cnt, re.I):
+                return True
+            if cnt.upper() in ("KEY CONCEPTS", "EXAMPLES", "CONCEPTS", "DEFINITIONS", "SUMMARY", "IMPORTANT POINTS"):
+                return True
+            if len(cnt.split()) > 15:
+                return True
+            if re.search(r'\b(?:NORMAL\s+FLOAT|AUTO\s+a\+bi|DEGREE\s+CL|STAT\s+EDIT|ZOOM\s+TRACE)\b', cnt, re.I):
+                return True
+
+        if real_cells:
+            avg_words = sum(len((c.get("content") or "").split()) for c in real_cells) / len(real_cells)
+            if avg_words > 7.0:
+                return True
+
+        # 5. Irregular grid check (varying column counts across rows)
+        if len(row_cell_counts) >= 2 and (max(row_cell_counts) - min(row_cell_counts) >= 3):
+            return True
             
         return False
 
@@ -879,7 +905,7 @@ class StructureEnforcer:
         for r in sorted(row_cells):
             rc = sorted(row_cells[r], key=lambda t: t[1])
             kids = [x for x, _ in rc]
-            row = {"type": "table_row", "id": self._new_id(tid, f"r{r}"), "kids": kids,
+            row = {"type": "table_row", "tag": "TR", "id": self._new_id(tid, f"r{r}"), "kids": kids,
                    "reading_order": table.get("reading_order"), "page_number": table.get("page_number")}
             u = _union([b for x in kids for b in _subtree_boxes(x)])
             if u:
@@ -1279,7 +1305,7 @@ def _set_heading_level(el, level):
 OUTLINE_HEADING_RE = re.compile(
     r'^\s*(?:'
     r'(?:chapter|section|part|appendix)\s+(\d+(?:\.\d+)*|[ivxlcdm]+)'
-    r'|(\d+(?:\.\d+)+)'
+    r'|(\d+(?:\.\d+)+)(?=[\s\.:\)\-])'
     r'|(\d+)[\.:\)]'
     r'|([ivxlcdm]+)[\.:\)]'
     r')[\.:\)]?\s*(.*)$',
@@ -1378,9 +1404,11 @@ def _is_excluded_from_heading(el, inside=False):
     tag = str(el.get("tag", "") or "").upper()
 
     # 1. Structural Containers
-    if t in ("table", "tr", "th", "td", "list", "li", "list_item", "lbl", "list_label", "lbody", "list_body", "toc", "toci", "figure", "form", "artifact"):
+    if t in ("table", "tr", "th", "td", "list", "li", "list_item", "lbl", "list_label", "lbody", "list_body", "toc", "toci", "figure", "form", "artifact", "formula"):
         return True
-    if tag in ("TABLE", "TR", "TH", "TD", "L", "LI", "LBL", "LBODY", "TOC", "TOCI", "FIGURE", "FORM", "ARTIFACT"):
+    if tag in ("TABLE", "TR", "TH", "TD", "L", "LI", "LBL", "LBODY", "TOC", "TOCI", "FIGURE", "FORM", "ARTIFACT", "FORMULA"):
+        return True
+    if any(k.get("tag") in ("Formula", "FORMULA") or k.get("type") in ("formula", "Formula") for k in el.get("kids", [])):
         return True
     if _type(el) in _NO_TITLE_INSIDE:
         return True
@@ -1436,6 +1464,19 @@ def _is_excluded_from_heading(el, inside=False):
 
     # 5. Form labels (short label ending with colon)
     if txt.endswith(':') and len(txt.split()) <= 4:
+        return True
+
+    # 6. Math formulas, single variables, or equation fragments
+    if len(txt) <= 1:
+        return True
+    if any(ch in txt for ch in ('=', '>', '<', '≤', '≥', '≈', '≠', '\u2212', '-', '\u221a', '√', '______', '+', '(', ')', '^', '/', '±')):
+        if not re.match(r'^\s*(?:chapter|section|part|unit|appendix)\b', txt, re.I):
+            return True
+    norm_w = txt.lower().rstrip(':,;.?!')
+    if len(txt.split()) == 1 and norm_w not in COMMON_HEADINGS and norm_w not in {
+        "examples", "summary", "exercises", "review", "concepts", "objectives", "definitions",
+        "notes", "references", "index", "glossary", "background", "conclusion", "conclusions", "appendix", "part"
+    } and not re.match(r'^(?:chapter|section|part|unit)\s*\d*$', txt, re.I):
         return True
 
     return False
@@ -1581,7 +1622,10 @@ def enforce_heading_hierarchy(doc_json):
                     first_h1_found = True
                     current_level = 1
                 else:
-                    lvl = 2 if is_common_hdr else min(6, max(2, current_level))
+                    if txt.strip().upper() in ("KEY CONCEPTS", "EXAMPLES", "CONCEPTS", "DEFINITIONS", "SUMMARY", "IMPORTANT POINTS"):
+                        lvl = 3
+                    else:
+                        lvl = 2 if is_common_hdr else min(6, max(2, current_level))
                     _set_heading_level(el, lvl)
                     current_level = lvl
                 el.pop("list_level", None)

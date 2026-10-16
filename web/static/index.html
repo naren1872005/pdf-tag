@@ -5,8 +5,172 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Autotagging for Figure - Automated PDF/UA Accessibility Remediation</title>
   <meta name="description" content="Convert scanned and digital PDFs into accessible, PDF/UA-1 compliant tagged documents with deterministic figure accessibility rules.">
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v=11">
   <link rel="icon" type="image/png" href="/static/favicon.png">
+  <style>
+    /* Direct resilient modal & button styles to override any cached CSS */
+    .modal-overlay {
+      position: fixed !important;
+      inset: 0 !important;
+      background: rgba(3, 7, 18, 0.85) !important;
+      backdrop-filter: blur(12px) !important;
+      -webkit-backdrop-filter: blur(12px) !important;
+      display: none !important;
+      align-items: center !important;
+      justify-content: center !important;
+      z-index: 99999 !important;
+      padding: 16px !important;
+    }
+    .modal-overlay.open {
+      display: flex !important;
+    }
+    .modal-card {
+      background: #111827 !important;
+      border: 1px solid rgba(255, 255, 255, 0.15) !important;
+      border-radius: 16px !important;
+      box-shadow: 0 25px 60px -10px rgba(0, 0, 0, 0.8), 0 0 45px rgba(99, 102, 241, 0.25) !important;
+      width: 100% !important;
+      max-width: 540px !important;
+      overflow: hidden !important;
+      color: #f8fafc !important;
+      font-family: 'Inter', -apple-system, sans-serif !important;
+    }
+    .modal-header {
+      display: flex !important;
+      justify-content: space-between !important;
+      align-items: center !important;
+      padding: 18px 24px !important;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important;
+      background: rgba(255, 255, 255, 0.03) !important;
+    }
+    .modal-title-wrap {
+      display: flex !important;
+      align-items: center !important;
+      gap: 12px !important;
+    }
+    .modal-icon {
+      font-size: 20px !important;
+      width: 38px !important;
+      height: 38px !important;
+      border-radius: 10px !important;
+      background: rgba(99, 102, 241, 0.2) !important;
+      display: flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      border: 1px solid rgba(99, 102, 241, 0.4) !important;
+    }
+    .modal-header h3 {
+      font-size: 17px !important;
+      font-weight: 600 !important;
+      color: #ffffff !important;
+      margin: 0 !important;
+    }
+    .modal-header p {
+      font-size: 12px !important;
+      color: #94a3b8 !important;
+      margin: 2px 0 0 0 !important;
+    }
+    .modal-close-btn {
+      background: transparent !important;
+      border: none !important;
+      color: #94a3b8 !important;
+      font-size: 26px !important;
+      cursor: pointer !important;
+      line-height: 1 !important;
+      padding: 4px 8px !important;
+      border-radius: 6px !important;
+    }
+    .modal-close-btn:hover {
+      color: #ffffff !important;
+      background: rgba(255, 255, 255, 0.1) !important;
+    }
+    .modal-body {
+      padding: 24px !important;
+    }
+    .modal-label {
+      display: block !important;
+      font-size: 13px !important;
+      font-weight: 500 !important;
+      color: #cbd5e1 !important;
+      margin-bottom: 8px !important;
+    }
+    .input-with-button {
+      display: flex !important;
+      align-items: center !important;
+      background: #090d16 !important;
+      border: 1px solid rgba(255, 255, 255, 0.15) !important;
+      border-radius: 10px !important;
+      overflow: hidden !important;
+    }
+    .input-with-button:focus-within {
+      border-color: #6366f1 !important;
+      box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.3) !important;
+    }
+    .input-with-button input {
+      flex: 1 !important;
+      background: transparent !important;
+      border: none !important;
+      outline: none !important;
+      padding: 12px 14px !important;
+      color: #ffffff !important;
+      font-family: monospace !important;
+      font-size: 13.5px !important;
+    }
+    .btn-toggle-eye {
+      background: transparent !important;
+      border: none !important;
+      cursor: pointer !important;
+      padding: 8px 14px !important;
+      font-size: 16px !important;
+      color: #94a3b8 !important;
+    }
+    .gemini-hint {
+      font-size: 12px !important;
+      color: #94a3b8 !important;
+      margin-top: 12px !important;
+      line-height: 1.5 !important;
+    }
+    .gemini-hint a {
+      color: #818cf8 !important;
+      text-decoration: underline !important;
+    }
+    .modal-footer {
+      display: flex !important;
+      align-items: center !important;
+      padding: 16px 24px !important;
+      background: rgba(255, 255, 255, 0.02) !important;
+      border-top: 1px solid rgba(255, 255, 255, 0.08) !important;
+      gap: 12px !important;
+    }
+    /* Summary action button placed next to Download button */
+    .btn-gemini-action {
+      display: inline-flex !important;
+      align-items: center !important;
+      gap: 8px !important;
+      background: rgba(30, 41, 59, 0.85) !important;
+      border: 1px solid rgba(99, 102, 241, 0.45) !important;
+      color: #e2e8f0 !important;
+      font-family: inherit !important;
+      font-size: 13.5px !important;
+      font-weight: 500 !important;
+      padding: 10px 18px !important;
+      border-radius: 10px !important;
+      cursor: pointer !important;
+      transition: all 0.2s ease !important;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25) !important;
+    }
+    .btn-gemini-action:hover {
+      background: rgba(49, 46, 129, 0.5) !important;
+      border-color: rgba(129, 140, 248, 0.7) !important;
+      transform: translateY(-1px) !important;
+      box-shadow: 0 4px 16px rgba(99, 102, 241, 0.3) !important;
+    }
+    .btn-gemini-action.active {
+      background: rgba(16, 185, 129, 0.15) !important;
+      border-color: rgba(16, 185, 129, 0.5) !important;
+      color: #a7f3d0 !important;
+    }
+  </style>
 </head>
 <body>
   <div class="container">
@@ -18,6 +182,13 @@
           <h1 class="logo-title">Autotagging for Figure</h1>
           <p class="logo-subtitle">Automated PDF Accessibility Engine</p>
         </div>
+      </div>
+      <div class="header-actions">
+        <button type="button" class="gemini-key-btn" id="gemini-key-btn" aria-label="Configure Gemini AI Key">
+          <span class="gemini-sparkle">✨</span>
+          <span class="gemini-btn-text" id="gemini-btn-text">Add Gemini Key</span>
+          <span class="gemini-status-pill offline" id="gemini-status-pill">Offline</span>
+        </button>
       </div>
     </header>
 
@@ -125,6 +296,11 @@
           </div>
 
           <div class="summary-actions">
+            <button type="button" class="btn-gemini-action" id="summary-gemini-btn" title="Configure Google Gemini API Key">
+              <span class="gemini-sparkle">✨</span>
+              <span id="summary-gemini-btn-text">Gemini API Key</span>
+              <span class="gemini-status-pill offline" id="summary-gemini-status-pill">Offline</span>
+            </button>
             <a href="#" class="btn-primary" id="download-pdf-btn" download>
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
@@ -199,6 +375,42 @@
     </main>
   </div>
 
-  <script src="/static/app.js"></script>
+  <!-- Gemini AI Key Modal -->
+  <div class="modal-overlay" id="gemini-modal" style="display: none;" role="dialog" aria-modal="true" aria-labelledby="modal-gemini-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title-wrap">
+          <span class="modal-icon">✨</span>
+          <div>
+            <h3 id="modal-gemini-title">Google Gemini AI Setup</h3>
+            <p>Empower Alt-Text Generation &amp; Math Reasoning</p>
+          </div>
+        </div>
+        <button type="button" class="modal-close-btn" id="close-gemini-modal" aria-label="Close dialog">&times;</button>
+      </div>
+      <div class="modal-body">
+        <label for="gemini-api-key-input" class="modal-label">Gemini API Key</label>
+        <div class="input-with-button">
+          <input type="password" id="gemini-api-key-input" placeholder="Paste your Gemini API key (AIzaSy...)" autocomplete="off">
+          <button type="button" class="btn-toggle-eye" id="toggle-key-visibility" title="Show/Hide Key">👁️</button>
+        </div>
+        <div class="gemini-hint">
+          <p style="margin-bottom: 6px;">💡 <strong>10,000+ Pages Safe</strong>: Automatic rate-limiting, SHA-256 caching &amp; multi-key rotation enabled. You can paste multiple keys separated by commas if processing huge batches.</p>
+          <p>Get a free API key from <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">Google AI Studio</a>. Keys are stored locally on your machine.</p>
+        </div>
+        <div class="gemini-status-msg" id="gemini-status-msg" style="display: none;"></div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn-danger" id="remove-gemini-key-btn" style="display: none;">Remove Key</button>
+        <div style="flex: 1;"></div>
+        <button type="button" class="btn-secondary" id="cancel-gemini-btn">Cancel</button>
+        <button type="button" class="btn-primary" id="save-gemini-key-btn">
+          <span>Connect &amp; Save</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=11"></script>
 </body>
 </html>

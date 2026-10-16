@@ -434,9 +434,15 @@ class DigitalStreamTagger:
                         # Formula has text but also vector paths like fraction bars
                         figure_nodes.append({"id": el_id, "bbox": bbox, "area": area, "tag": tag, "depth": depth})
 
+                    has_text_kids = bool(el.get("kids")) and any(
+                        k.get("tag") in ("Formula", "Span", "Reference", "Link") or
+                        k.get("type") in ("formula", "span", "reference", "link", "hyperlink")
+                        for k in el["kids"]
+                    )
                     if el_type != "figure" and tag != "Figure" and content.strip() and el_type not in DigitalStreamTagger.TEXT_TYPES_EXCLUDED and tag != "OBJR" \
                             and tag not in DigitalStreamTagger.STRUCTURE_ONLY_TAGS \
-                            and not (tag in ("LI", "TOCI") and el.get("kids")):
+                            and not (tag in ("LI", "TOCI") and el.get("kids")) \
+                            and not has_text_kids:
                         runs = []
                         for r in (font_runs_by_id or {}).get(el_id, []) or []:
                             rb = r.get("bbox")
@@ -1024,24 +1030,18 @@ class DigitalStreamTagger:
         FontInfo._cache.clear()  # object numbers are only unique within one PDF
 
         # ------------------------------------------------------------------
-        # 0. Drop the input's old marked content (keep /OC visibility groups).
+        # 0. Drop all old marked content delimiters to prevent invalid nesting
+        #    (PDF/UA-1 Clause 7.1 requires clean StructTree or /Artifact marking)
         # ------------------------------------------------------------------
-        cleaned, stack = [], []
+        cleaned = []
         for inst in instructions:
             if isinstance(inst, pikepdf.ContentStreamInlineImage):
                 cleaned.append(inst)
                 continue
             op = str(inst.operator)
-            if op in ("BDC", "BMC"):
-                keep = bool(inst.operands) and str(inst.operands[0]) == "/OC"
-                stack.append(keep)
-                if keep:
-                    cleaned.append(inst)
-            elif op == "EMC":
-                if (stack.pop() if stack else False):
-                    cleaned.append(inst)
-            else:
-                cleaned.append(inst)
+            if op in ("BDC", "BMC", "EMC"):
+                continue
+            cleaned.append(inst)
         instructions = cleaned
         T.sanitize_page_objects(pdf, page_obj)
 
@@ -1128,6 +1128,10 @@ class DigitalStreamTagger:
                     # smallest JSON container (cell, list item...) or figure that holds it.
                     holders = [c for c in container_nodes if T._inside(g.cx, g.cy, c["bbox"], 1.0)]
                     f = T._figure_for_box(g.bbox, figure_nodes, 0.5)
+                    if f is None and figure_nodes:
+                        cands = [fig for fig in figure_nodes if T._inside(g.cx, g.cy, fig["bbox"], 14.0)]
+                        if cands:
+                            f = min(cands, key=lambda fig: fig["area"])
                     if holders and not any(ch.isalnum() for ch in (g.uni or "")):
                         glyph_owner[(ui, gi)] = None  # punctuation follows its neighbouring words
                         continue
@@ -1147,8 +1151,22 @@ class DigitalStreamTagger:
                     elif f is not None and f["tag"] != "Artifact":
                         glyph_owner[(ui, gi)] = ("node", f["id"])
                     else:
-                        glyph_owner[(ui, gi)] = ART
-                        orphans.append(g.uni)
+                        # Fallback for unassigned text in page body:
+                        # Never mark readable text as ART on page body (violates ISO 14289-1 and PAC Quality).
+                        cands_fig = [fig for fig in figure_nodes if fig["tag"] != "Artifact" and T._rect_dist(g.cx, g.cy, fig["bbox"]) <= 250.0]
+                        cands_text = [m for m in text_nodes if m["id"] not in artifact_nodes and m["tag"] not in ("Artifact", "OBJR", "Lbl")]
+                        if cands_fig:
+                            best_fig = min(cands_fig, key=lambda fig: T._rect_dist(g.cx, g.cy, fig["bbox"]))
+                            glyph_owner[(ui, gi)] = ("node", best_fig["id"])
+                            recovered.append(g.uni)
+                        elif cands_text:
+                            best_n = min(cands_text, key=lambda m: T._rect_dist(g.cx, g.cy, m["bbox"]))
+                            glyph_owner[(ui, gi)] = ("node", best_n["id"])
+                            (node_invis if invisible else node_vis)[best_n["id"]].append((ui, gi))
+                            recovered.append(g.uni)
+                        else:
+                            glyph_owner[(ui, gi)] = ART
+                            orphans.append(g.uni)
                     continue
                 if n["id"] in artifact_nodes or n["tag"] == "Artifact":
                     glyph_owner[(ui, gi)] = ART
@@ -1552,7 +1570,14 @@ class DigitalStreamTagger:
                 f = T._figure_for_box(u.bbox, figure_nodes, 0.5) or T._figure_inside_image(u.bbox, figure_nodes)
                 unit_owner[ui] = ("node", f["id"]) if (f and f["tag"] != "Artifact") else ART
             elif u.kind == "path":
-                f = T._figure_for_box(u.bbox, figure_nodes, 0.8) if u.bbox else None
+                f = T._figure_for_box(u.bbox, figure_nodes, 0.2) if u.bbox else None
+                if f is None and u.bbox and figure_nodes:
+                    cands = [fig for fig in figure_nodes if fig["tag"] != "Artifact" and (
+                        T._inside((u.bbox[0] + u.bbox[2]) / 2, (u.bbox[1] + u.bbox[3]) / 2, fig["bbox"], 12.0) or
+                        T._rect_dist((u.bbox[0] + u.bbox[2]) / 2, (u.bbox[1] + u.bbox[3]) / 2, fig["bbox"]) <= 40.0
+                    )]
+                    if cands:
+                        f = min(cands, key=lambda fig: T._rect_dist((u.bbox[0] + u.bbox[2]) / 2, (u.bbox[1] + u.bbox[3]) / 2, fig["bbox"]))
                 unit_owner[ui] = ("node", f["id"]) if (f and f["tag"] != "Artifact") else ART
             else:
                 unit_owner[ui] = ART
@@ -1566,7 +1591,13 @@ class DigitalStreamTagger:
         text_order = [ui for ui, u in enumerate(units) if u.kind == "text"]
 
         def is_blank(u):
-            return bool(u.glyphs) and all(g.uni and not g.uni.strip() for g in u.glyphs)
+            if not u.glyphs:
+                return False
+            for g in u.glyphs:
+                uni = g.uni or ""
+                if any(c.isalnum() or (c.isprintable() and not c.isspace() and ord(c) > 32 and ord(c) not in (0x7F, 0x85, 0xA0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000)) for c in uni):
+                    return False
+            return True
 
         def edge_owner(ui, last):
             o = unit_owner.get(ui)
@@ -1595,7 +1626,12 @@ class DigitalStreamTagger:
             elif next_o is not None and next_o != ART:
                 new_o = next_o            # leading space of the next word
             else:
-                new_o = ART               # spaces between decorations / artifacts
+                cands = [m for m in text_nodes if m["id"] not in artifact_nodes and m["tag"] not in ("Artifact", "OBJR", "Lbl")]
+                if cands and u.bbox:
+                    cx, cy = (u.bbox[0] + u.bbox[2]) / 2, (u.bbox[1] + u.bbox[3]) / 2
+                    new_o = ("node", min(cands, key=lambda m: T._rect_dist(cx, cy, m["bbox"]))["id"])
+                else:
+                    new_o = ("node", text_nodes[0]["id"]) if text_nodes else ART
             if new_o != unit_owner.get(ui):
                 unit_owner[ui] = new_o
                 blank_fixed += 1
@@ -1620,7 +1656,10 @@ class DigitalStreamTagger:
                 return
             close()
             if owner == ART:
-                out.append(ContentStreamInstruction([Name("/Artifact")], Operator("BMC")))
+                out.append(ContentStreamInstruction([
+                    Name("/Artifact"),
+                    Dictionary(Type=Name("/Layout"), Subtype=Name("/Layout"))
+                ], Operator("BDC")))
             elif owner[0] == "link":
                 out.append(ContentStreamInstruction([Name("/Link"), Dictionary(MCID=mcid)], Operator("BDC")))
                 link_groups[(owner[1], owner[2])].setdefault("mcids", []).append(mcid)
@@ -1678,6 +1717,15 @@ class DigitalStreamTagger:
                     return MIXED
             return owner
 
+        def block_has_non_blank(a, b):
+            lo = bisect.bisect_left(unit_starts, a)
+            hi = bisect.bisect_right(unit_starts, b)
+            for st in unit_starts[lo:hi]:
+                u = unit_at[st][1]
+                if u.kind != "text" or not is_blank(u):
+                    return True
+            return False
+
         def emit_range(a, b):
             nonlocal split_ops
             i = a
@@ -1689,10 +1737,18 @@ class DigitalStreamTagger:
                         j = match[i]
                         bo = block_owner(i, j)
                         if bo is EMPTY:
-                            out.extend(instructions[i:j + 1])     # clip / state only
-                        elif bo is not MIXED:
-                            ensure(bo)
+                            ensure(ART)
                             out.extend(instructions[i:j + 1])
+                            close()
+                        elif bo is not MIXED:
+                            if bo != ART and not block_has_non_blank(i, j):
+                                ensure(ART)
+                                out.extend(instructions[i:j + 1])
+                                close()
+                            else:
+                                ensure(bo)
+                                out.extend(instructions[i:j + 1])
+                                close()
                         else:
                             close()
                             out.append(inst)
@@ -1711,6 +1767,16 @@ class DigitalStreamTagger:
                             out.extend(piece_insts)
                         i += 1
                         continue
+                    if u.kind == "text" and is_blank(u):
+                        if open_owner[0] is not None and open_owner[0] != ART:
+                            out.extend(instructions[u.start:u.end + 1])
+                            i = u.end + 1
+                            continue
+                        ensure(ART)
+                        out.extend(instructions[u.start:u.end + 1])
+                        close()
+                        i = u.end + 1
+                        continue
                     ensure(owner)
                     out.extend(instructions[u.start:u.end + 1])
                     i = u.end + 1
@@ -1718,6 +1784,8 @@ class DigitalStreamTagger:
                 if not isinstance(inst, pikepdf.ContentStreamInlineImage):
                     if str(inst.operator) in ("q", "Q", "BT", "ET", "BDC", "BMC", "EMC"):
                         close()   # unmatched block boundary / kept /OC sequence
+                    elif open_owner[0] is None and str(inst.operator) in ('Tj', 'TJ', "'", '"', 'Do', 'm', 'l', 'c', 'v', 'y', 'h', 're', 'S', 's', 'f', 'F', 'f*', 'B', 'B*', 'b', 'b*', 'sh'):
+                        ensure(ART)
                 out.append(inst)
                 i += 1
 
