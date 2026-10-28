@@ -372,6 +372,7 @@ function drawPageBoundingBoxes(pageData, imgEl, svgEl) {
   const allElements = [];
   function collect(els) {
     (els || []).forEach(el => {
+      if ((el.tag || '').toUpperCase() === 'ARTIFACT' || (el.type || '').toLowerCase() === 'artifact') return;
       allElements.push(el);
       if (el.kids) collect(el.kids);
     });
@@ -473,6 +474,7 @@ function renderTagTree() {
     let totalTagsOnPage = 0;
     function countNodes(els) {
       (els || []).forEach(e => {
+        if ((e.tag || '').toUpperCase() === 'ARTIFACT' || (e.type || '').toLowerCase() === 'artifact') return;
         totalTagsOnPage++;
         if (e.kids) countNodes(e.kids);
       });
@@ -532,23 +534,9 @@ function renderTagTree() {
 }
 
 function getElementSummaryText(el) {
-  const tag = (el.tag || el.type || '').toUpperCase();
-
-  // For LBL with Span child, the bullet belongs strictly inside Span, not on LBL
-  if ((tag === 'LBL' || el.type === 'list_label') && el.kids && el.kids.length > 0) {
-    return '';
+  if (el.actual_text && el.actual_text.trim()) {
+    return el.actual_text.trim();
   }
-
-  // For Span, display bullet content directly
-  if (tag === 'SPAN' || el.type === 'span') {
-    if (el.content && el.content.trim()) {
-      return el.content.trim();
-    }
-    if (el.actual_text && el.actual_text.trim()) {
-      return el.actual_text.trim();
-    }
-  }
-
   if (el.content && el.content.trim()) {
     return el.content.trim();
   }
@@ -631,7 +619,8 @@ function getElementSummaryText(el) {
 }
 
 function renderElementTreeNode(el, pNum, container) {
-  const elKey = getElementDomKey(pNum, el);
+  if ((el.tag || '').toUpperCase() === 'ARTIFACT' || (el.type || '').toLowerCase() === 'artifact') return;
+
   const nodeEl = document.createElement('div');
   nodeEl.className = 'tree-node';
   nodeEl.id = `tree-node-${elKey}`;

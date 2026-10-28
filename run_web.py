@@ -7,7 +7,14 @@ import time
 import uvicorn
 
 # Ensure the root directory is in sys.path
-base_path = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, 'frozen', False):
+    base_path = sys._MEIPASS
+    pocr_path = os.path.join(base_path, 'paddleocr')
+    if os.path.exists(pocr_path) and pocr_path not in sys.path:
+        sys.path.insert(0, pocr_path)
+else:
+    base_path = os.path.dirname(os.path.abspath(__file__))
+
 if base_path not in sys.path:
     sys.path.insert(0, base_path)
 
@@ -48,7 +55,11 @@ def main():
 
     threading.Thread(target=open_browser, daemon=True).start()
     try:
-        uvicorn.run("web.server:app", host="127.0.0.1", port=8000, reload=True, log_level="info")
+        if getattr(sys, 'frozen', False):
+            from web.server import app
+            uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")
+        else:
+            uvicorn.run("web.server:app", host="127.0.0.1", port=8000, reload=True, log_level="info")
     except KeyboardInterrupt:
         print("\nServer stopped.")
 

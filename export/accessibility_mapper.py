@@ -36,6 +36,8 @@ class AccessibilityMapper:
         "objr": "OBJR",
         "span": "Span",
         "Span": "Span"
+        "objr": "OBJR",
+        "span": "Span"
     }
 
     @classmethod
@@ -48,6 +50,7 @@ class AccessibilityMapper:
             "P", "H1", "H2", "H3", "H4", "H5", "H6", "H",
             "LI", "LBody", "Table", "TR", "TH", "TD", "Figure", "Formula",
             "Caption", "Form", "Link", "Note", "Reference", "L", "Lbl",
+            "TOC", "TOCI", "OBJR", "Span"
             "TOC", "TOCI", "OBJR", "Span"
         }
         if el_type in explicit_tags:

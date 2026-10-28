@@ -86,14 +86,14 @@ class StructTreeBuilder:
             K=Array()
         ))
         struct_tree_root.K = Array([doc_elem])
-        
+
         sect_elem = pdf.make_indirect(Dictionary(
             Type=Name("/StructElem"),
-            S=Name("/Art"),
+            S=Name("/Sect"),
             P=doc_elem,
             K=Array()
         ))
-        doc_elem.K.append(sect_elem)
+        doc_elem.K = Array([sect_elem])
         return struct_tree_root, sect_elem
 
 

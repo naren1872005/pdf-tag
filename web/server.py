@@ -15,9 +15,18 @@ from core.remediator import TaggingService
 
 app = FastAPI(title="Autotagging for Figure - PDF Accessibility Tagging Engine")
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-STATIC_DIR = BASE_DIR / "web" / "static"
-UPLOADS_DIR = BASE_DIR / "workspace_web"
+import sys
+
+if getattr(sys, "frozen", False):
+    BUNDLE_DIR = Path(sys._MEIPASS)
+    STATIC_DIR = BUNDLE_DIR / "web" / "static"
+    EXE_DIR = Path(sys.executable).resolve().parent
+    UPLOADS_DIR = EXE_DIR / "workspace_web"
+else:
+    BASE_DIR = Path(__file__).resolve().parent.parent
+    STATIC_DIR = BASE_DIR / "web" / "static"
+    UPLOADS_DIR = BASE_DIR / "workspace_web"
+
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Mount static files

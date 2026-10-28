@@ -15,6 +15,8 @@ dist*/
 dist_*/
 *.spec.bak
 *.manifest
+TagPilot_Web.spec
+python_exe.py
 
 # Inno Setup output & Executables
 *_setup/
@@ -63,6 +65,20 @@ mcid_out.txt
 output.txt
 out_ops.txt
 original_content_stream.txt
+app/run.md
+
+# ==========================================
+# Test PDFs, Tested Files & Audit Runs
+# ==========================================
+*.pdf
+audits/
+test_runs/
+*test_runs*/
+*tested*
+"pdf for testing"/
+tests/fixtures/
+tests/**/*.pdf
+tests/test_runs/
 
 # ==========================================
 # Secrets & Environment variables
@@ -90,7 +106,6 @@ htmlcov/
 Thumbs.db
 [Dd]esktop.ini
 .DS_Store
-
 
 Alternative_OCR/
 # Runtime uploads and generated PDF outputs

@@ -1611,27 +1611,67 @@ class DigitalStreamTagger:
             if not is_blank(u):
                 continue
             prev_o = next_o = None
+            prev_u = next_u = None
             for q in range(pos - 1, -1, -1):
                 if not is_blank(units[text_order[q]]):
                     prev_o = edge_owner(text_order[q], True)
+                    prev_u = units[text_order[q]]
                     break
             for q in range(pos + 1, len(text_order)):
                 if not is_blank(units[text_order[q]]):
                     next_o = edge_owner(text_order[q], False)
+                    next_u = units[text_order[q]]
                     break
-            if prev_o is not None and prev_o != ART and prev_o[0] == "link" and next_o != prev_o:
+
+            # Geometry proximity check: only attach blank if it is physically adjacent on the same line
+            u_glyphs = u.glyphs
+            if not u_glyphs:
+                continue
+            u_x0 = min(g.bbox[0] for g in u_glyphs)
+            u_y0 = min(g.bbox[1] for g in u_glyphs)
+            u_x1 = max(g.bbox[2] for g in u_glyphs)
+            u_y1 = max(g.bbox[3] for g in u_glyphs)
+            u_h = max(max(g.height for g in u_glyphs), 4.0)
+            u_ymid = (u_y0 + u_y1) / 2.0
+
+            nearby_prev = False
+            if prev_u and prev_u.glyphs:
+                p_glyphs = prev_u.glyphs
+                p_x1 = max(g.bbox[2] for g in p_glyphs)
+                p_ymid = (min(g.bbox[1] for g in p_glyphs) + max(g.bbox[3] for g in p_glyphs)) / 2.0
+                p_h = max(max(g.height for g in p_glyphs), 4.0)
+                same_line = abs(p_ymid - u_ymid) <= max(4.0, 0.5 * min(u_h, p_h))
+                dx = u_x0 - p_x1
+                if same_line and (-1.5 <= dx <= max(20.0, 2.0 * min(u_h, p_h))):
+                    nearby_prev = True
+
+            nearby_next = False
+            if next_u and next_u.glyphs:
+                n_glyphs = next_u.glyphs
+                n_x0 = min(g.bbox[0] for g in n_glyphs)
+                n_ymid = (min(g.bbox[1] for g in n_glyphs) + max(g.bbox[3] for g in n_glyphs)) / 2.0
+                n_h = max(max(g.height for g in n_glyphs), 4.0)
+                same_line = abs(n_ymid - u_ymid) <= max(4.0, 0.5 * min(u_h, n_h))
+                dx = n_x0 - u_x1
+                if same_line and (-1.5 <= dx <= max(20.0, 2.0 * min(u_h, n_h))):
+                    nearby_next = True
+
+            if prev_o is not None and prev_o != ART and prev_o[0] == "link" and next_o != prev_o and nearby_prev:
                 new_o = ("node", prev_o[1])  # space after a link belongs to the sentence
-            elif prev_o is not None and prev_o != ART:
-                new_o = prev_o            # trailing space of the previous word
-            elif next_o is not None and next_o != ART:
-                new_o = next_o            # leading space of the next word
-            else:
-                cands = [m for m in text_nodes if m["id"] not in artifact_nodes and m["tag"] not in ("Artifact", "OBJR", "Lbl")]
-                if cands and u.bbox:
-                    cx, cy = (u.bbox[0] + u.bbox[2]) / 2, (u.bbox[1] + u.bbox[3]) / 2
-                    new_o = ("node", min(cands, key=lambda m: T._rect_dist(cx, cy, m["bbox"]))["id"])
+            elif prev_o is not None and prev_o != ART and nearby_prev:
+                # Do not attach trailing whitespace to a heading (headings only enclose their actual text)
+                if prev_o[0] == "node" and str(node_id_to_tag.get(prev_o[1], "")).startswith("H"):
+                    new_o = ART
                 else:
-                    new_o = ("node", text_nodes[0]["id"]) if text_nodes else ART
+                    new_o = prev_o            # trailing space of the previous word on the same line
+            elif next_o is not None and next_o != ART and nearby_next:
+                # Do not attach leading whitespace to a heading
+                if next_o[0] == "node" and str(node_id_to_tag.get(next_o[1], "")).startswith("H"):
+                    new_o = ART
+                else:
+                    new_o = next_o            # leading space of the next word on the same line
+            else:
+                new_o = ART               # isolated stray whitespace is an artifact
             if new_o != unit_owner.get(ui):
                 unit_owner[ui] = new_o
                 blank_fixed += 1
@@ -1736,19 +1776,12 @@ class DigitalStreamTagger:
                     if op in ("q", "BT") and i in match and match[i] <= b:
                         j = match[i]
                         bo = block_owner(i, j)
+                        is_heading_block = (bo not in (EMPTY, MIXED, ART) and bo[0] == "node" and str(node_id_to_tag.get(bo[1], "")).startswith("H"))
                         if bo is EMPTY:
-                            ensure(ART)
+                            out.extend(instructions[i:j + 1])     # clip / state only
+                        elif bo is not MIXED and not (op == "q" and is_heading_block):
+                            ensure(bo)
                             out.extend(instructions[i:j + 1])
-                            close()
-                        elif bo is not MIXED:
-                            if bo != ART and not block_has_non_blank(i, j):
-                                ensure(ART)
-                                out.extend(instructions[i:j + 1])
-                                close()
-                            else:
-                                ensure(bo)
-                                out.extend(instructions[i:j + 1])
-                                close()
                         else:
                             close()
                             out.append(inst)

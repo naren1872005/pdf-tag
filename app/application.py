@@ -5,7 +5,12 @@ from PySide6.QtGui import QPalette, QColor
 from engine.project_manager import ProjectManager
 from gui.main_window import MainWindow
 from gui.controller import AppController
-from app.activation import run_license_gate
+
+try:
+    from app.activation import run_license_gate
+except ImportError:
+    run_license_gate = None
+
 
 class TaggingApplication:
     def __init__(self, argv):
@@ -67,15 +72,9 @@ class TaggingApplication:
 
         def _preload():
             try:
-                from parser.gemini_scheduler import GeminiRequestScheduler
-                GeminiRequestScheduler()          # remote config -> credentials (no HTTP clients yet)
-            except Exception as e:
-                print(f"Failed to pre-initialize GeminiRequestScheduler: {e}")
-            try:
-                import app.workers                # gemini_extractor, pipeline engine, plugins
                 import engine.pipeline_manager
-            except Exception as e:
-                print(f"Background module preload failed: {e}")
+            except Exception:
+                pass
 
         threading.Thread(target=_preload, name="TagPilotPreload", daemon=True).start()
 
@@ -253,7 +252,7 @@ class TaggingApplication:
         # thread behind a small modal dialog (nothing can be used until it passes).
         self.main_window.showMaximized()
         self.app.processEvents()
-        if not run_license_gate(self.main_window):
+        if run_license_gate and not run_license_gate(self.main_window):
             self.main_window._force_quit = True
             self.main_window.close()
             self._end_process(0)

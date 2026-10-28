@@ -5,7 +5,9 @@ class BookmarkBuilder:
     @staticmethod
     def build(pdf, doc_json, page_objs):
         """
-        Reads the finalized semantic heading hierarchy and builds the PDF outline.
+        Reads the finalized semantic heading hierarchy and builds the PDF outline/bookmarks.
+        Conforms strictly to PDF/UA-1 accessibility standards with hierarchical nesting
+        and /XYZ coordinate targets.
         """
         headings = []
         for p in doc_json.get("pages", []):
@@ -17,16 +19,36 @@ class BookmarkBuilder:
             
             def extract_headings(els):
                 for el in els:
-                    if el.get("type") == "heading":
-                        level = int(el.get("heading_level", 1))
-                        content = el.get("content", f"Heading {level}")
-                        # Remove newlines for bookmark title
+                    # Skip artifacts or decorative page furniture
+                    t_str = str(el.get("type", "")).lower()
+                    tag_str = str(el.get("tag", "")).upper()
+                    if t_str == "artifact" or tag_str == "ARTIFACT":
+                        continue
+
+                    is_h = t_str == "heading" or tag_str in ("H1", "H2", "H3", "H4", "H5", "H6") or t_str in ("h1", "h2", "h3", "h4", "h5", "h6")
+                    if is_h:
+                        level = el.get("heading_level")
+                        if level is None:
+                            for candidate in (tag_str, t_str.upper()):
+                                if candidate.startswith("H") and len(candidate) == 2 and candidate[1].isdigit():
+                                    level = int(candidate[1])
+                                    break
+                        if level is None:
+                            level = 1
+                        try:
+                            level = int(level)
+                        except (ValueError, TypeError):
+                            level = 1
+
+                        content = el.get("content") or el.get("text") or f"Heading {level}"
                         content = str(content).replace('\n', ' ').strip()
                         if content:
+                            bbox = el.get("_geom") or el.get("bounding_box")
                             headings.append({
                                 "level": level,
                                 "title": content,
-                                "page_obj": page_obj
+                                "page_obj": page_obj,
+                                "bbox": bbox
                             })
                     if el.get("kids"):
                         extract_headings(el["kids"])
@@ -47,7 +69,17 @@ class BookmarkBuilder:
             stack = [(0, outline.root)]
             
             for h in headings:
-                dest = Array([h["page_obj"].obj if hasattr(h["page_obj"], "obj") else h["page_obj"], Name("/Fit")])
+                p_obj = h["page_obj"].obj if hasattr(h["page_obj"], "obj") else h["page_obj"]
+                bbox = h.get("bbox")
+                
+                # Use PDF /XYZ destination targeting top-left of the heading
+                if isinstance(bbox, dict) and "left" in bbox and "top" in bbox:
+                    dest = Array([p_obj, Name("/XYZ"), int(round(bbox["left"])), int(round(bbox["top"])), None])
+                elif isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                    dest = Array([p_obj, Name("/XYZ"), int(round(bbox[0])), int(round(bbox[3])), None])
+                else:
+                    dest = Array([p_obj, Name("/Fit")])
+
                 item = OutlineItem(h["title"], destination=dest)
                 
                 # Pop until we find a parent with level < h["level"]

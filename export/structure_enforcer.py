@@ -505,21 +505,41 @@ class StructureEnforcer:
                     if own.startswith(marker):
                         text = own[len(marker):].strip()
                 if marker:
-                    label = self._make("list_label", li, "lbl", content=marker,
+                    label = self._make("list_label", li, "lbl",
                                        bbox=li.get("label_bounding_box") or li.get("bounding_box"))
-                    label["actual_text"] = marker
+                    label["tag"] = "Lbl"
+                    span_node = self._make("span", label, "span", content=marker,
+                                           bbox=label.get("bounding_box"))
+                    span_node["tag"] = "Span"
+                    span_node["actual_text"] = " Bullet " if marker in ("•", "n", "■", "●") else marker
+                    label["kids"] = [span_node]
+                    label["content"] = ""
                 body = self._make("list_body", li, "lbody", content=text, bbox=li.get("bounding_box"))
+                body["tag"] = "LBody"
                 for key in ("lines", "font", "font size", "analysis"):
                     if key in li:
                         body[key] = li[key]
-                self.changes.append("split LI text into Lbl + LBody")
+                self.changes.append("split LI text into Lbl (with Span) + LBody")
             elif body is None:
                 body = self._make("list_body", li, "lbody", content=own, bbox=li.get("bounding_box"))
+                body["tag"] = "LBody"
             li["content"] = ""
             li.pop("lines", None)
 
+        # Ensure existing label wraps its bullet in a Span child if missing
+        if label is not None and not label.get("kids"):
+            lbl_c = (label.get("content") or "").strip()
+            if lbl_c:
+                span_node = self._make("span", label, "span", content=lbl_c,
+                                       bbox=label.get("bounding_box"))
+                span_node["tag"] = "Span"
+                span_node["actual_text"] = " Bullet " if lbl_c in ("•", "n", "■", "●") else lbl_c
+                label["kids"] = [span_node]
+                label["content"] = ""
+
         if body is None and (rest or nested_items):
             body = self._make("list_body", li, "lbody", kids=[], bbox=li.get("bounding_box"))
+            body["tag"] = "LBody"
         if body is not None:
             body.setdefault("kids", [])
             body["kids"].extend(rest)
@@ -1190,9 +1210,15 @@ def assemble_list_section(items, next_id, page_num):
               "page_number": page_num, "bounding_box": bbox, "confidence": el.get("confidence", 1.0),
               "list_level": level, "kids": []}
         if label:
-            lbl = {"type": "list_label", "id": nid(), "reading_order": el.get("reading_order"),
-                   "page_number": page_num, "content": label, "actual_text": label,
-                   "bounding_box": el.get("label_bounding_box") or bbox}
+            lbl = {"type": "list_label", "tag": "Lbl", "id": nid(), "reading_order": el.get("reading_order"),
+                   "page_number": page_num, "content": "", "actual_text": label,
+                   "bounding_box": el.get("label_bounding_box") or bbox,
+                   "kids": [{
+                       "type": "span", "tag": "Span", "id": nid(), "reading_order": el.get("reading_order"),
+                       "page_number": page_num, "content": label,
+                       "actual_text": " Bullet " if label in ("•", "n", "■", "●") else label,
+                       "bounding_box": el.get("label_bounding_box") or bbox
+                   }]}
             li["kids"].append(lbl)
         body = {"type": "list_body", "id": nid(), "reading_order": el.get("reading_order"),
                 "page_number": page_num, "content": text, "bounding_box": bbox, "kids": []}
@@ -1597,39 +1623,22 @@ def enforce_heading_hierarchy(doc_json):
                         current_level = 1
                     else:
                         _set_heading_level(el, 2)
-                        current_level = 2
-                    el.pop("list_level", None)
-                    el.pop("list_label", None)
-        else:
-            if _is_excluded_from_heading(el, inside):
-                continue
-            # Check for unnumbered heading
-            norm_lower = txt.lower().rstrip(':').strip()
-            is_common_hdr = norm_lower in COMMON_HEADINGS
-            is_already_hdr = _type(el) == "heading" or str(el.get("tag", "")).upper() in ("H1", "H2", "H3", "H4", "H5", "H6")
-            is_title_candidate = (
-                not is_common_hdr and not is_already_hdr and
-                len(txt) <= 60 and 1 <= len(txt.split()) <= 7 and
-                not txt.endswith(('.', ',', ';', ':', '?', '!')) and
-                not re.search(r'\.\s+[A-Z]', txt) and
-                (el.get("is_bold") or (txt.istitle() or txt.isupper()))
-            )
 
-            if is_common_hdr or is_already_hdr or is_title_candidate:
-                el["type"] = "heading"
-                if not first_h1_found and (el.get("page_number") or 1) == 1:
-                    _set_heading_level(el, 1)
-                    first_h1_found = True
-                    current_level = 1
-                else:
-                    if txt.strip().upper() in ("KEY CONCEPTS", "EXAMPLES", "CONCEPTS", "DEFINITIONS", "SUMMARY", "IMPORTANT POINTS"):
-                        lvl = 3
-                    else:
-                        lvl = 2 if is_common_hdr else min(6, max(2, current_level))
-                    _set_heading_level(el, lvl)
-                    current_level = lvl
-                el.pop("list_level", None)
-                el.pop("list_label", None)
+    # PDF/UA Heading Hierarchy Validation: prevent skipping heading levels (e.g. H1 -> H3)
+    heading_stack = []
+    for el, inside in ordered:
+        if inside or _heading_level(el) is None:
+            continue
+        lvl = _heading_level(el)
+        while heading_stack and heading_stack[-1] >= lvl:
+            heading_stack.pop()
+        parent_lvl = heading_stack[-1] if heading_stack else 0
+        if lvl > parent_lvl + 1:
+            # Heading level skipped a tier (e.g. parent is 1, current is 3 -> adjust to 2)
+            adjusted_lvl = parent_lvl + 1
+            _set_heading_level(el, adjusted_lvl)
+            lvl = adjusted_lvl
+        heading_stack.append(lvl)
 
 
 def ensure_h1(doc_json):

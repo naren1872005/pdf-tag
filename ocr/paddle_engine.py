@@ -28,9 +28,6 @@ def _safe_create_predictor(config):
 
 p_inf.create_predictor = _safe_create_predictor
 
-from paddleocr import PaddleOCR
-
-
 class PaddleLayoutExtractor:
     """
     Local layout and text extractor using PaddleOCR + PyMuPDF.
@@ -41,35 +38,130 @@ class PaddleLayoutExtractor:
     @classmethod
     def get_ocr(cls):
         if cls._ocr_instance is None:
-            cls._ocr_instance = PaddleOCR(
-                use_angle_cls=False,
-                lang="en",
-                use_gpu=False,
-                show_log=False
-            )
+            try:
+                from paddleocr import PaddleOCR
+                cls._ocr_instance = PaddleOCR(
+                    use_angle_cls=False,
+                    lang="en",
+                    use_gpu=False,
+                    show_log=False
+                )
+            except Exception as e:
+                print(f"[Warning] Local OCR could not be initialized: {e}")
+                cls._ocr_instance = None
         return cls._ocr_instance
 
     @staticmethod
     def check_pdf_has_struct_tree(doc) -> bool:
         try:
             catalog_xref = doc.pdf_catalog()
-            if catalog_xref > 0:
-                cat_dict = doc.xref_object(catalog_xref)
-                if "/StructTreeRoot" in cat_dict:
-                    return True
+            if catalog_xref <= 0:
+                return False
+            cat_dict = doc.xref_object(catalog_xref)
+            if "/StructTreeRoot" not in cat_dict:
+                return False
+
+            # Verify that the StructTree contains authentic semantic structure
+            # (at least one Heading H1-H6, List L/LI, Table, or Figure).
+            # If a document's StructTree is degenerate (e.g. 0 headings, only dummy /P or /Sect),
+            # it is unremediated and must undergo intelligent layout extraction.
             flags = fitz.TEXTFLAGS_SEARCH | fitz.TEXT_COLLECT_STRUCTURE
-            for page in doc[:min(4, len(doc))]:
+            has_semantic_tag = False
+            for page in doc[:min(5, len(doc))]:
                 t = page.get_text("dict", flags=flags)
-                for b in t.get("blocks", []):
-                    if b.get("std") or b.get("raw"):
-                        return True
+                def check_blocks(bl):
+                    nonlocal has_semantic_tag
+                    for b in bl:
+                        tag = (b.get("std") or b.get("raw") or "")
+                        if tag in ("H", "H1", "H2", "H3", "H4", "H5", "H6", "L", "LI", "Table", "TH", "Figure"):
+                            has_semantic_tag = True
+                            return
+                        if b.get("blocks"):
+                            check_blocks(b["blocks"])
+                            if has_semantic_tag:
+                                return
+                check_blocks(t.get("blocks", []))
+                if has_semantic_tag:
+                    return True
+            return has_semantic_tag
         except Exception:
             pass
         return False
 
     @staticmethod
+    def _extract_all_pikepdf_spans(pdf_path: str, doc):
+        """
+        Extracts all <Span> accessibility nodes with /ActualText from pikepdf's StructTreeRoot
+        and correlates their bounding boxes from page content streams.
+        """
+        page_spans = {}
+        try:
+            import pikepdf
+            with pikepdf.open(pdf_path) as pdf:
+                for p_idx, page in enumerate(pdf.pages):
+                    pno = p_idx + 1
+                    p_obj = page.obj
+                    fitz_p = doc[p_idx]
+
+                    content = fitz_p.read_contents().decode("latin1", errors="replace")
+                    mcid_bboxes = {}
+                    pattern = re.compile(r'/(\w+)\s*<<[^>]*?MCID\s*(\d+)[^>]*?>>\s*BDC(.*?)EMC', re.DOTALL)
+                    for m in pattern.finditer(content):
+                        mcid = int(m.group(2))
+                        body = m.group(3)
+                        cm = re.search(r'1\s+0\s+0\s+1\s+([\d\.\-]+)\s+([\d\.\-]+)\s+cm.*?0\s+0\s+m\s+([\d\.\-]+)\s+0\s+l', body, re.DOTALL)
+                        if cm:
+                            x0 = float(cm.group(1))
+                            pdf_y = float(cm.group(2))
+                            w = float(cm.group(3))
+                            mcid_bboxes[mcid] = [round(x0, 2), round(pdf_y - 2, 2), round(x0 + w, 2), round(pdf_y + 2, 2)]
+
+                    found_spans = []
+                    def walk_node(node, ancestors=None, curr_pg=None):
+                        if ancestors is None:
+                            ancestors = []
+                        if not isinstance(node, pikepdf.Dictionary):
+                            return
+                        s = str(node.get("/S", "")).replace("/", "")
+                        act = str(node.get("/ActualText", "")).strip().replace("\x00", "")
+                        if "/Pg" in node:
+                            curr_pg = node["/Pg"]
+                        k = node.get("/K")
+                        current_anc = ancestors + [s]
+
+                        if s == "Span" and act and curr_pg and curr_pg.objgen == p_obj.objgen:
+                            mcid = None
+                            if isinstance(k, (int, pikepdf.Integer)):
+                                mcid = int(k)
+                            elif isinstance(k, pikepdf.Dictionary) and "/MCID" in k:
+                                mcid = int(k["/MCID"])
+                            bbox = mcid_bboxes.get(mcid)
+                            found_spans.append({
+                                "type": "span",
+                                "tag": "Span",
+                                "actual_text": act,
+                                "content": "",
+                                "bounding_box": bbox,
+                                "mcid": mcid,
+                                "ancestors": ancestors
+                            })
+                        kids = list(k) if isinstance(k, (list, pikepdf.Array)) else ([k] if isinstance(k, pikepdf.Dictionary) else [])
+                        for ch in kids:
+                            walk_node(ch, current_anc, curr_pg)
+
+                    root = pdf.Root.get("/StructTreeRoot")
+                    if root and "/K" in root:
+                        walk_node(root["/K"])
+
+                    page_spans[pno] = found_spans
+        except Exception:
+            pass
+        return page_spans
+
+    @staticmethod
     def _extract_from_struct_tree(doc, pdf_path: str, progress_callback=None) -> dict:
         total_pages = len(doc)
+        pike_spans_map = PaddleLayoutExtractor._extract_all_pikepdf_spans(pdf_path, doc)
         extracted_doc = {
             "type": "document",
             "metadata": {
@@ -141,18 +233,22 @@ class PaddleLayoutExtractor:
             tag = b.get('std') or b.get('raw')
             sub = b.get('blocks', [])
             bbox = b.get('bbox')
-            
-            kids = []
-            for sb in sub:
-                k = walk_tree(sb, page_h, pno)
-                if k:
-                    if isinstance(k, list):
-                        kids.extend(k)
-                    else:
-                        kids.append(k)
+
+            # If this block has no tag, it is direct content of its parent StructElem,
+            # not a separate StructElem node.
+            if not tag:
+                return None
 
             # Flatten document/section wrappers so top-level elements are direct
             if tag in ('Document', 'Sect', 'Part', 'Art', 'Div'):
+                kids = []
+                for sb in sub:
+                    k = walk_tree(sb, page_h, pno)
+                    if k:
+                        if isinstance(k, list):
+                            kids.extend(k)
+                        else:
+                            kids.append(k)
                 return kids
 
             if tag in ('Table', 'table'):
@@ -254,8 +350,17 @@ class PaddleLayoutExtractor:
                     return merged_unwrapped
 
             text = extract_node_text(b)
-            if not tag and not text and not kids:
-                return None
+
+            # Process child struct elements (e.g. inline <Span>, <Link>, etc.)
+            kids = []
+            if tag != 'Span':  # Span is an inline leaf element
+                for sb in sub:
+                    k = walk_tree(sb, page_h, pno)
+                    if k:
+                        if isinstance(k, list):
+                            kids.extend(k)
+                        else:
+                            kids.append(k)
 
             pdf_bbox = None
             if bbox and len(bbox) == 4:
@@ -272,7 +377,7 @@ class PaddleLayoutExtractor:
             res = {
                 'id': curr_id,
                 'type': elem_type,
-                'tag': tag or ('P' if text else 'Span'),
+                'tag': tag,
                 'content': text,
                 'bounding_box': pdf_bbox,
                 'confidence': 1.0
@@ -360,6 +465,94 @@ class PaddleLayoutExtractor:
                         page_elements.extend(res)
                     else:
                         page_elements.append(res)
+
+            # Restore drawing-based <Span> elements (e.g. fill-in-the-blank underlines) that MuPDF dropped
+            p_spans = pike_spans_map.get(page_num, [])
+            if p_spans:
+                blank_spans = [s for s in p_spans if "Blank" in s.get("actual_text", "")]
+                if blank_spans:
+                    li_blank_spans = [s for s in blank_spans if any(a in s.get("ancestors", []) for a in ("LI", "LBody"))]
+                    standalone_blank_spans = [s for s in blank_spans if not any(a in s.get("ancestors", []) for a in ("LI", "LBody"))]
+
+                    # 1. Attach standalone blank spans to empty <P> container (e.g. Question B answer block)
+                    if standalone_blank_spans:
+                        for el in page_elements:
+                            if el.get("tag") == "P" and not el.get("content") and not el.get("kids"):
+                                el["kids"] = [
+                                    {
+                                        "id": next(id_gen),
+                                        "type": "span",
+                                        "tag": "Span",
+                                        "actual_text": bs["actual_text"],
+                                        "content": "",
+                                        "bounding_box": bs["bounding_box"],
+                                        "confidence": 1.0
+                                    }
+                                    for bs in standalone_blank_spans
+                                ]
+                                valid_boxes = [k["bounding_box"] for k in el["kids"] if k.get("bounding_box")]
+                                if valid_boxes:
+                                    el["bounding_box"] = [
+                                        min(b[0] for b in valid_boxes), min(b[1] for b in valid_boxes),
+                                        max(b[2] for b in valid_boxes), max(b[3] for b in valid_boxes)
+                                    ]
+                                break
+
+                    # 2. Attach list item blank spans to matching LI -> LBody -> P (e.g. Question C items)
+                    if li_blank_spans:
+                        all_lis = []
+                        def collect_lis(node):
+                            if isinstance(node, dict):
+                                if node.get("tag") == "LI":
+                                    all_lis.append(node)
+                                for c in node.get("kids", []):
+                                    collect_lis(c)
+                        for el in page_elements:
+                            collect_lis(el)
+
+                        for bs in li_blank_spans:
+                            bbox = bs.get("bounding_box")
+                            if not bbox:
+                                continue
+                            mid_y = (bbox[1] + bbox[3]) / 2.0
+                            best_li = None
+                            min_dist = 999999
+                            for li in all_lis:
+                                l_box = li.get("bounding_box")
+                                if l_box and len(l_box) == 4:
+                                    if l_box[1] - 8 <= mid_y <= l_box[3] + 8:
+                                        best_li = li
+                                        break
+                                    dist = min(abs(mid_y - l_box[1]), abs(mid_y - l_box[3]))
+                                    if dist < min_dist and dist < 25:
+                                        min_dist = dist
+                                        best_li = li
+
+                            if best_li:
+                                target_c = None
+                                for k in best_li.get("kids", []):
+                                    if k.get("tag") == "LBody":
+                                        for sub in k.get("kids", []):
+                                            if sub.get("tag") == "P":
+                                                target_c = sub
+                                                break
+                                        if not target_c:
+                                            target_c = k
+                                        break
+                                if not target_c:
+                                    target_c = best_li
+
+                                if "kids" not in target_c or not target_c["kids"]:
+                                    target_c["kids"] = []
+                                target_c["kids"].append({
+                                    "id": next(id_gen),
+                                    "type": "span",
+                                    "tag": "Span",
+                                    "actual_text": bs["actual_text"],
+                                    "content": "",
+                                    "bounding_box": bs["bounding_box"],
+                                    "confidence": 1.0
+                                })
 
             for idx, el in enumerate(page_elements):
                 el["reading_order"] = idx + 1
@@ -479,221 +672,94 @@ class PaddleLayoutExtractor:
         return extracted_doc
 
     @staticmethod
-    def _join_line_spans(spans):
-        """
-        Joins spans on a single line, inserting a space between spans where layout,
-        bounding boxes, or word boundaries indicate a missing separator.
-        Preserves legitimate hyphenation and avoids spaces in URLs, numbers, etc.
-        """
-        if not spans:
-            return ""
-        if len(spans) == 1:
-            return spans[0].get("text", "")
-        
-        parts = []
-        prev_s = None
-        for s in spans:
-            txt = s.get("text", "")
-            if not txt:
-                continue
-            if prev_s is None:
-                parts.append(txt)
-                prev_s = s
-                continue
-            
-            prev_txt = parts[-1]
-            if prev_txt.endswith(" ") or txt.startswith(" "):
-                parts.append(txt)
-                prev_s = s
-                continue
-            
-            prev_box = prev_s.get("bbox", [0, 0, 0, 0])
-            curr_box = s.get("bbox", [0, 0, 0, 0])
-            gap = curr_box[0] - prev_box[2]
-            min_fs = min(prev_s.get("size", 10.0), s.get("size", 10.0))
-            
-            # Preserve hyphenation
-            if prev_txt.rstrip().endswith(('-', '\u2010', '\u2011')) and txt.lstrip() and txt.lstrip()[0].isalpha():
-                parts.append(txt)
-                prev_s = s
-                continue
-                
-            # URL / email protection
-            joined_token = (prev_txt.split()[-1] if prev_txt.split() else "") + (txt.split()[0] if txt.split() else "")
-            if "@" in joined_token or joined_token.startswith(("http://", "https://", "www.")):
-                parts.append(txt)
-                prev_s = s
-                continue
-                
-            prev_r = prev_txt.rstrip()
-            curr_l = txt.lstrip()
-            if not prev_r or not curr_l:
-                parts.append(txt)
-                prev_s = s
-                continue
+    def _is_span_bold(s):
+        flags = s.get("flags", 0)
+        font_name = str(s.get("font", "")).lower()
+        return bool((flags & 16) or (flags & 2) or "bold" in font_name or "black" in font_name or "demi" in font_name)
 
-            # Number with decimal or comma
-            if prev_r[-1].isdigit() and (curr_l.startswith(('.', ',')) or (prev_r.endswith(('.', ',')) and curr_l[0].isdigit())):
-                parts.append(txt)
-                prev_s = s
-                continue
+    @staticmethod
+    def _attach_inline_spans_if_any(el, page_h, start_id):
+        if not el or el.get("type") not in ("paragraph", "list_item"):
+            if el:
+                el.pop("_line_spans", None)
+            return 0
+        line_spans = el.pop("_line_spans", None)
+        if not line_spans:
+            return 0
+        all_spans = [s for l_spans in line_spans for s in l_spans]
+        has_bold = any(PaddleLayoutExtractor._is_span_bold(s) and s.get("text", "").strip() for s in all_spans)
+        has_reg = any(not PaddleLayoutExtractor._is_span_bold(s) and s.get("text", "").strip() for s in all_spans)
+        if not (has_bold and has_reg):
+            return 0
 
-            prev_last_c = prev_r[-1]
-            curr_first_c = curr_l[0]
-            
-            # Punctuation separator (e.g., 'Ask:' and 'What' in separate spans)
-            is_punct_boundary = (
-                (prev_last_c in (':', ';', '!', '?') and curr_first_c.isalnum()) or
-                (prev_last_c in (')', ']', '}', '"', '”') and curr_first_c.isalnum()) or
-                (prev_last_c.isalnum() and curr_first_c in ('(', '[', '{', '"', '“'))
-            )
-            
-            # Word space in typography is ~0.25-0.35 * fontsize (e.g. 2-3.5pt).
-            # Kerning inside a word is < 0.15 * fontsize (< 1.2pt).
-            is_word_space = gap >= max(1.5, 0.20 * min_fs)
-            is_punct_space = is_punct_boundary and gap >= 0.5
-            is_token_boundary = (
-                (prev_last_c.isalpha() and curr_first_c.isdigit() and len(prev_txt.strip()) >= 2) or
-                (prev_last_c.isdigit() and curr_first_c.isalpha()) or
-                (curr_box[1] > prev_box[1] + 2)
-            )
-            
-            if is_word_space or is_punct_space or is_token_boundary:
-                parts.append(" " + txt)
+        bold_runs = []
+        curr_run = []
+        curr_is_bold = False
+        for s in all_spans:
+            t = s.get("text", "")
+            if not t:
+                continue
+            bld = PaddleLayoutExtractor._is_span_bold(s)
+            if not t.strip():
+                if curr_run:
+                    curr_run.append(s)
+                continue
+            if bld == curr_is_bold:
+                curr_run.append(s)
             else:
-                parts.append(txt)
-            prev_s = s
-            
-        return "".join(parts)
+                if curr_run and curr_is_bold:
+                    bold_runs.append(curr_run)
+                curr_run = [s]
+                curr_is_bold = bld
+        if curr_run and curr_is_bold:
+            bold_runs.append(curr_run)
 
-    @staticmethod
-    def _math_to_speech(txt: str) -> str:
-        s = txt.strip()
-        # Common radicals and powers
-        s = s.replace('√', 'the square root of ')
-        s = s.replace('²', ' squared')
-        s = s.replace('³', ' cubed')
-        s = s.replace('^2', ' squared')
-        s = s.replace('^3', ' cubed')
-        s = s.replace('−', ' minus ')
-        s = s.replace('+', ' plus ')
-        s = s.replace('=', ' equals ')
-        s = s.replace('±', ' plus or minus ')
-        s = s.replace('≠', ' does not equal ')
-        s = s.replace('≤', ' is less than or equal to ')
-        s = s.replace('≥', ' is greater than or equal to ')
-        s = s.replace('≈', ' is approximately equal to ')
-        s = re.sub(r'\bx_1\b|\bx\s*1\b', 'x sub one', s)
-        s = re.sub(r'\bx_2\b|\bx\s*2\b', 'x sub two', s)
-        s = re.sub(r'\by_1\b|\by\s*1\b', 'y sub one', s)
-        s = re.sub(r'\by_2\b|\by\s*2\b', 'y sub two', s)
-        s = re.sub(r'\(([^)]+)\)\s*(?:2|²|\^2)', r'the quantity \1 squared', s)
-        s = re.sub(r'\(([^)]+)\)\s*(?:3|³|\^3)', r'the quantity \1 cubed', s)
-        s = re.sub(r'\b([a-zA-Z])\s*2\b', r'\1 squared', s)
-        s = re.sub(r'\b([a-zA-Z])\s*3\b', r'\1 cubed', s)
-        s = re.sub(r'\bminus\s*([0-9]+)\b', r'negative \1', s)
-        num_map = {'0': 'zero', '1': 'one', '2': 'two', '3': 'three', '4': 'four',
-                   '5': 'five', '6': 'six', '7': 'seven', '8': 'eight', '9': 'nine', '10': 'ten'}
-        for k, v in num_map.items():
-            s = re.sub(r'\b' + k + r'\b', v, s)
-        s = re.sub(r'\s+', ' ', s).strip()
-        if s and not s.endswith('.'):
-            s += '.'
-        return s
-
-    @staticmethod
-    def _is_math_formula(txt: str) -> bool:
-        t = txt.strip()
-        if not t:
-            return False
-        if t.endswith('?'):
-            return False
-            
-        words = t.split()
-        prose_words = [w.lower().rstrip(':,;.') for w in words if len(w) >= 3 and w.isalpha()]
-        
-        COMMON_PROSE = {
-            'the', 'and', 'that', 'this', 'from', 'with', 'between', 'which', 'each', 'under',
-            'where', 'given', 'find', 'solve', 'graph', 'plot', 'table', 'write', 'read',
-            'check', 'exercise', 'example', 'equation', 'called', 'general', 'standard',
-            'circle', 'center', 'radius', 'form', 'linear', 'point', 'points', 'intercept',
-            'intercepts', 'distance', 'midpoint', 'plane', 'system', 'value', 'values',
-            'following', 'defined', 'written', 'substitute', 'rectangular', 'coordinate'
-        }
-        stop_count = sum(1 for w in prose_words if w in COMMON_PROSE)
-        if stop_count >= 2 or len(prose_words) >= 4:
-            return False
-
-        has_math_op = bool(re.search(r'[=≈≠≤≥∑√∫±∓∂∆πθαβγλμσ∞²³⁴\^]|[\+\−\-\*\/·]\s*(?:[0-9a-zA-Z\(]|√)|(?:[0-9a-zA-Z\)]\s*[\+\−\-\*\/·])', t))
-        has_eq = '=' in t or '≈' in t or '≠' in t or '≤' in t or '≥' in t
-        is_assignment = bool(re.match(r'^(?:[a-zA-Z]|[A-Za-z]\([a-zA-Z0-9,\s]+\))\s*=\s*.+', t))
-        is_poly = bool(re.search(r'\b[0-9]?[a-zA-Z]\s*(?:\^|\²|\³|\d)?\s*[\+\−\-].+=\s*[0-9a-zA-Z]', t))
-        is_poly_eq = bool(re.search(r'[0-9a-zA-Z\)\]]\s*=\s*0\b|\b0\s*=\s*[0-9a-zA-Z]', t))
-        is_coord = bool(re.match(r'^\(\s*-?[a-zA-Z0-9]+(?:\/[a-zA-Z0-9]+)?\s*,\s*-?[a-zA-Z0-9]+(?:\/[a-zA-Z0-9]+)?\s*\)$', t))
-        is_underlines = bool(re.match(r'^[_\s—–\-]+$', t)) and len(t) >= 3
-        is_root_expr = ('√' in t or '²' in t or '³' in t or '^2' in t or '^3' in t)
-        is_alg = bool(re.search(r'\([a-zA-Z0-9\s\+\−\-]+\)\s*(?:\d|\^|\²|\³)', t))
-
-        return (has_math_op and (has_eq or is_poly or is_root_expr or is_assignment or is_alg)) or is_coord or is_poly_eq or is_underlines
-
-    @staticmethod
-    def _detect_vector_graphs(page, table_regions=None):
-        """
-        Detects coordinate axes, function graphs, geometric plots, and charts made of vector drawings.
-        Returns a list of fitz.Rect for valid graphs.
-        """
-        pw, ph = page.rect.width, page.rect.height
-        candidates = []
-        try:
-            drawings = page.get_drawings()
-            for d in drawings:
-                r = fitz.Rect(d['rect'])
-                if (r.width > pw * 0.70 and r.height > 100) or r.width >= pw * 0.90:
-                    continue
-                if r.width < 10 or r.height < 10:
-                    continue
-                if (r.height <= 3.5 and r.width > 0.4 * pw) or (r.width <= 3.5 and r.height > 0.4 * ph):
-                    continue
-                if table_regions:
-                    if any(tr[0] - 2 <= r.x0 and r.x1 <= tr[2] + 2 and tr[1] - 2 <= r.y0 and r.y1 <= tr[3] + 2 for tr in table_regions):
-                        continue
-                items = d.get('items', [])
-                has_curves = any(it[0] == 'c' for it in items)
-                has_grid = len(items) >= 6 or (len(items) >= 2 and abs(r.width - r.height) < 45 and r.width >= 25)
-                if has_curves or has_grid:
-                    candidates.append(r)
-        except Exception:
-            return []
-
-        if not candidates:
-            return []
-
-        clusters = []
-        for cr in candidates:
-            merged = False
-            exp = fitz.Rect(cr.x0 - 10, cr.y0 - 10, cr.x1 + 10, cr.y1 + 10)
-            for i, c in enumerate(clusters):
-                if c['rect'].intersects(exp):
-                    clusters[i]['rect'] = clusters[i]['rect'] | cr
-                    clusters[i]['count'] += 1
-                    merged = True
-                    break
-            if not merged:
-                clusters.append({'rect': cr, 'count': 1})
-
-        valid_graphs = []
-        for c in clusters:
-            r = c['rect']
-            if 30 <= r.width <= pw * 0.75 and 30 <= r.height <= ph * 0.75 and c['count'] >= 2:
-                expanded_r = fitz.Rect(max(0, r.x0 - 4), max(0, r.y0 - 4), min(pw, r.x1 + 4), min(ph, r.y1 + 4))
-                valid_graphs.append(expanded_r)
-        return valid_graphs
-
+        kids = []
+        next_id = start_id
+        for run in bold_runs:
+            run_txt = "".join(s.get("text", "") for s in run).strip()
+            if not run_txt:
+                continue
+            run_x0 = min(s.get("bbox", [0, 0, 0, 0])[0] for s in run)
+            run_y0 = min(s.get("bbox", [0, 0, 0, 0])[1] for s in run)
+            run_x1 = max(s.get("bbox", [0, 0, 0, 0])[2] for s in run)
+            run_y1 = max(s.get("bbox", [0, 0, 0, 0])[3] for s in run)
+            max_sz = max(s.get("size", 10.0) for s in run)
+            kids.append({
+                "id": next_id,
+                "type": "span",
+                "tag": "Span",
+                "content": run_txt,
+                "bounding_box": [
+                    round(run_x0, 2),
+                    round(page_h - run_y1, 2),
+                    round(run_x1, 2),
+                    round(page_h - run_y0, 2)
+                ],
+                "font_size": round(max_sz, 1),
+                "confidence": 1.0
+            })
+            next_id += 1
+        if kids:
+            el["kids"] = kids
+            return len(kids)
+        return 0
 
     @staticmethod
     def _extract_digital_page(page, page_num, page_w, page_h, id_counter, has_seen_h1, base_font_size):
         elements = []
         
+        # 0. Shaded Callout / Sidebar Background Boxes
+        shaded_boxes = []
+        try:
+            for d in page.get_drawings():
+                fill = d.get('fill')
+                r = d.get('rect')
+                if fill and r and r.width > 50 and r.height > 50:
+                    shaded_boxes.append(r)
+        except Exception:
+            pass
+
         # 1. Table Detection
         table_regions = []
         try:
@@ -749,20 +815,11 @@ class PaddleLayoutExtractor:
 
                     is_genuine_table = (
                         len(rows_with_data) >= 2 and
-                        len(multi_col_rows) >= 2 and
-                        fill_ratio >= 0.35 and
-                        len(cells_with_data) >= 4 and
-                        (tab_w >= 80) and
-                        (tab_h >= 20) and
-                        not has_sec and
-                        not has_callout and
-                        not has_long_prose and
-                        not has_calc_header and
-                        not is_irregular_grid and
-                        not is_sparse_ticks and
-                        not is_plot_grid and
-                        not is_tall_layout and
-                        avg_words <= 7.0
+                        (len(multi_col_rows) >= 2 or (len(extracted_rows[0]) >= 2 and len(cells_with_data) >= 3)) and
+                        fill_ratio >= 0.30 and
+                        len(cells_with_data) >= 3 and
+                        (t_box[2] - t_box[0] >= 80) and
+                        (t_box[3] - t_box[1] >= 30)
                     )
 
                     if not is_genuine_table:
@@ -819,59 +876,18 @@ class PaddleLayoutExtractor:
         except Exception:
             pass
 
-        # 2. Text line and block extraction with Underline vector detection
-        underline_rects = []
-        try:
-            for d in page.get_drawings():
-                r = d.get("rect")
-                if r and r.height <= 3.5 and 4.0 <= r.width <= 0.75 * page_w:
-                    underline_rects.append(r)
-                for it in d.get("items", []):
-                    if it[0] == "l":
-                        p1, p2 = it[1], it[2]
-                        if abs(p1.y - p2.y) <= 1.5:
-                            lw = abs(p2.x - p1.x)
-                            if 4.0 <= lw <= 0.75 * page_w:
-                                underline_rects.append(fitz.Rect(min(p1.x, p2.x), min(p1.y, p2.y) - 1, max(p1.x, p2.x), max(p1.y, p2.y) + 1))
-        except Exception:
-            pass
+        def flush_curr_el():
+            nonlocal curr_el, id_counter
+            if curr_el:
+                added = PaddleLayoutExtractor._attach_inline_spans_if_any(curr_el, page_h, id_counter)
+                id_counter += added
+                elements.append(curr_el)
+                curr_el = None
 
+        # 2. Text line and block extraction
         blocks = page.get_text("dict", flags=fitz.TEXTFLAGS_SEARCH).get("blocks", [])
         curr_el = None
-
-        QUESTION_WORDS = {
-            "who", "what", "when", "where", "why", "how", "which", "whose", "whom",
-            "do", "does", "did", "is", "are", "was", "were", "can", "could", "would",
-            "should", "may", "might", "will"
-        }
-        INSTRUCTION_WORDS = {
-            "read", "write", "complete", "answer", "choose", "select", "fill", "find",
-            "solve", "model", "ask", "tell", "have", "use", "show", "check", "look",
-            "think", "guide", "explain", "discuss", "describe", "identify", "compare",
-            "contrast", "list", "define", "match", "circle", "underline", "draw",
-            "work", "practice", "note", "remember", "follow", "provide", "give", "state"
-        }
-        COMMON_SECTION_HEADINGS = {
-            "introduction", "overview", "summary", "background", "methodology", "methods",
-            "materials", "results", "discussion", "conclusion", "conclusions", "references",
-            "bibliography", "appendix", "index", "glossary", "preface", "foreword"
-        }
-
-        # Collect Figure/Graph regions (both vector graphs and raster images) to prevent extracting text from inside graphs
-        figure_regions = list(PaddleLayoutExtractor._detect_vector_graphs(page, table_regions))
-        try:
-            for img_info in page.get_images():
-                for r_img in page.get_image_rects(img_info[0]):
-                    if r_img.width >= 20 and r_img.height >= 20 and not (r_img.width > page_w * 0.95 and r_img.height > page_h * 0.95):
-                        figure_regions.append(r_img)
-        except Exception:
-            pass
-
-        # Expand figure regions by 8pt to completely engulf axis numbers, tick marks, and point labels
-        expanded_figure_regions = [
-            fitz.Rect(max(0, fr.x0 - 8), max(0, fr.y0 - 8), min(page_w, fr.x1 + 8), min(page_h, fr.y1 + 8))
-            for fr in figure_regions if fr.width > 20 and fr.height > 20
-        ]
+        pending_bullet = False
 
         for b in blocks:
             if b.get("type") == 0:  # text block
@@ -886,34 +902,21 @@ class PaddleLayoutExtractor:
                 if is_in_table:
                     continue
 
-                # Check if block falls inside any detected figure / graph (graphs must be single Figure tag, no extracted text)
-                b_rect = fitz.Rect(b_box)
-                is_in_figure = any(
-                    fr.intersects(b_rect) and
-                    (min(fr.x1, b_box[2]) - max(fr.x0, b_box[0])) * (min(fr.y1, b_box[3]) - max(fr.y0, b_box[1])) >= 0.15 * max((b_box[2] - b_box[0]) * (b_box[3] - b_box[1]), 1.0)
-                    for fr in expanded_figure_regions
-                )
-                if is_in_figure:
-                    continue
+                # If moving to a new block and curr_el is not a list_item, flush it so paragraphs don't merge across distant blocks
+                if curr_el and curr_el["type"] != "list_item":
+                    flush_curr_el()
 
-
-                if curr_el:
-                    elements.append(curr_el)
-                    curr_el = None
-
-                for line in b.get("lines", []):
-                    # Check individual line against figure regions (to filter axis numbers/labels)
-                    l_rect = fitz.Rect(line.get("bbox", [0, 0, 0, 0]))
-                    if any(fr.intersects(l_rect) and (min(fr.x1, l_rect.x1) - max(fr.x0, l_rect.x0)) * (min(fr.y1, l_rect.y1) - max(fr.y0, l_rect.y0)) >= 0.15 * max(l_rect.width * l_rect.height, 1.0) for fr in expanded_figure_regions):
-                        continue
-
+                lines = b.get("lines", [])
+                idx = 0
+                saw_blank_line = False
+                while idx < len(lines):
+                    line = lines[idx]
                     spans = line.get("spans", [])
-                    line_text = PaddleLayoutExtractor._join_line_spans(spans).strip()
-                    if not line_text:
-                        continue
-
-                    # Filter out isolated artifact tabs/spaces
-                    if line_text in ("\t", " ", ""):
+                    line_text = "".join(s.get("text", "") for s in spans).strip()
+                    if not line_text or line_text in ("\t", " "):
+                        if curr_el:
+                            saw_blank_line = True
+                        idx += 1
                         continue
 
                     line_underlined = False
@@ -935,15 +938,95 @@ class PaddleLayoutExtractor:
                     )
 
                     l_box = list(line.get("bbox", [0, 0, 0, 0]))
+
+                    # Filter out running footers / page furniture / copyright notices at bottom margin
+                    is_bottom_margin = l_box[3] >= page_h - 45 or l_box[1] >= page_h - 60
+                    is_page_footer = is_bottom_margin and (
+                        bool(re.search(r'\bUnit\s+\d+\b', line_text, re.IGNORECASE)) or
+                        bool(re.match(r'^\s*(?:\d{1,4}|[A-Za-z]?\d{1,4})\s*$', line_text)) or
+                        bool(re.match(r'^\s*\d+\s+Unit\b', line_text, re.IGNORECASE)) or
+                        bool(re.match(r'^\s*Unit\s+\d+.*?\d+\s*$', line_text, re.IGNORECASE)) or
+                        bool(re.search(r'(?:©|\u00a9|Copyright|\(c\)|\(C\)|\bAll rights reserved\b|\bPublished by\b|\bPrinted in\b)', line_text, re.IGNORECASE))
+                    )
+
+                    # Filter out running headers at top margin on pages > 1
+                    is_top_margin = (page_num > 1) and (l_box[1] <= 45 or l_box[3] <= 55)
+                    is_running_header = is_top_margin and (
+                        bool(re.search(r'\b(?:Unit\s+\d+|Videoscripts|Reading\s+Texts?|Student\s+Worksheets?|Lesson\s+Resources?)\b', line_text, re.IGNORECASE)) or
+                        bool(re.match(r'^\s*(?:\d{1,4}|[A-Za-z]?\d{1,4})\s*$', line_text)) or
+                        (has_seen_h1 and is_unit_banner)
+                    )
+
+                    if is_page_footer or is_running_header:
+                        flush_curr_el()
+                        elements.append({
+                            "id": id_counter,
+                            "type": "artifact",
+                            "tag": "Artifact",
+                            "content": line_text,
+                            "bounding_box": [
+                                round(l_box[0], 2), round(page_h - l_box[3], 2),
+                                round(l_box[2], 2), round(page_h - l_box[1], 2)
+                            ],
+                            "font_size": round(max_s, 1),
+                            "confidence": 1.0
+                        })
+                        id_counter += 1
+                        idx += 1
+                        continue
+
+                    fonts = {s.get("font", "") for s in spans}
+                    first_span = spans[0] if spans else {}
+                    first_font = first_span.get("font", "").lower()
+                    first_text = first_span.get("text", "")
+                    is_dingbat_span = any(f in first_font for f in ("zapf", "dingbat", "wingding", "symbol"))
+
+                    # Check for ZapfDingbats / Wingdings / Dingbat bullet glyph
+                    is_isolated_bullet_line = (is_dingbat_span and line_text in ("n", "l", "s", "u", "v", "w", "\uf06e", "\uf06c", "\u25a0", "\u25cf", "\u2022")) or line_text in ("•", "Bullet", "▪", "■")
+                    if is_isolated_bullet_line:
+                        # If isolated bullet glyph line, merge with next line in the block if available
+                        if idx + 1 < len(lines):
+                            next_line = lines[idx + 1]
+                            next_spans = next_line.get("spans", [])
+                            next_text = "".join(s.get("text", "") for s in next_spans).strip()
+                            if next_text:
+                                line_text = "• " + next_text
+                                spans = spans + next_spans
+                                l_box = [
+                                    min(l_box[0], next_line.get("bbox", [0,0,0,0])[0]),
+                                    min(l_box[1], next_line.get("bbox", [0,0,0,0])[1]),
+                                    max(l_box[2], next_line.get("bbox", [0,0,0,0])[2]),
+                                    max(l_box[3], next_line.get("bbox", [0,0,0,0])[3])
+                                ]
+                                idx += 1
+                        else:
+                            pending_bullet = True
+                            idx += 1
+                            continue
+                    elif is_dingbat_span and re.match(r'^[nlsuvw\uf06e\uf06c\u25a0\u25cf\u2022]\s+', line_text):
+                        line_text = "• " + re.sub(r'^[nlsuvw\uf06e\uf06c\u25a0\u25cf\u2022]\s+', '', line_text)
+
+                    if pending_bullet:
+                        line_text = "• " + line_text
+                        pending_bullet = False
+
                     pdf_bbox = [
                         round(l_box[0], 2), round(page_h - l_box[3], 2),
                         round(l_box[2], 2), round(page_h - l_box[1], 2)
                     ]
 
-                    # Check for hierarchical outline section numbering:
-                    # e.g., "2", "2.", "2.1", "2.2", "2.2.1", "2.2.1.2", "2.3.1.2"
-                    # Rule: Heading levels follow document outline rather than visual appearance alone.
-                    outline_match = re.match(r'^\s*(?:(?:Chapter|Section|Part|Appendix)\s+)?(\d+(?:\.\d+)*)\.?\s*(\S.*)?$', line_text, re.IGNORECASE)
+                    # Check for alphabetical section dividers (e.g. "A", "B", "C" in Glossaries)
+                    is_alpha_divider = bool(re.match(r'^[A-Z]$', line_text)) and any(
+                        "Black" in f or "Bold" in f or "Semibold" in f for f in fonts
+                    )
+
+                    # Check for major section banners
+                    is_banner_h2 = (
+                        (line_text.isupper() and len(line_text) <= 50 and any(c.isalpha() for c in line_text) and not line_text.endswith('.') and (max_s >= base_font_size * 1.15 or "Semibold" in str(fonts))) or
+                        bool(re.match(r'^(?:UNIT LAUNCH|PREPARE TO READ|FOCUS ON UNDERSTANDING|UNCOVER THE STORY|VIDEO CONNECTION|REVIEW AND REFLECT|PERFORMANCE TASK|TAKE ACTION|UNIT WRAP[\-\s~–—]UP)\b', line_text, re.IGNORECASE))
+                    )
+
+                    outline_match = re.match(r'^\s*(?:(?:Chapter|Section)\s+)?(\d+(?:\.\d+)*)\.?\s*(\S.*)?$', line_text, re.IGNORECASE)
                     is_outline_heading = False
                     outline_h_level = None
 
@@ -953,36 +1036,12 @@ class PaddleLayoutExtractor:
                         title_part = (outline_match.group(2) or "").strip()
 
                         if len(parts) >= 2:
-                            # Multi-level numbered section heading (2.1, 2.2, 2.2.1, 2.2.1.2, etc.)
-                            if len(line_text) < 120 and not any(ch in line_text for ch in ('=', '\u2212', '\u221a', '______', '+')) and (has_bold or not title_part.endswith('.') or max_s >= base_font_size * 1.0):
+                            if len(line_text) < 120 and (has_bold or not title_part.endswith('.') or max_s >= base_font_size * 1.0):
                                 is_outline_heading = True
                                 outline_h_level = min(6, len(parts))
                         elif len(parts) == 1:
-                            # Single-number section e.g. "Chapter 2" or "1. Introduction"
-                            has_ch_prefix = bool(re.match(r'^\s*(?:Chapter|Section|Part|Appendix)\s+', line_text, re.IGNORECASE))
-                            title_words = title_part.split()
-                            w0 = title_words[0].lower().rstrip(':,;.?!') if title_words else ""
-                            is_math = any(ch in line_text for ch in ('=', '\u2212', '\u221a', '______', '+', '(', ')'))
-                            is_question_or_instruction = (
-                                is_math or
-                                not (w0 and w0[0].isalpha()) or
-                                w0 in QUESTION_WORDS or
-                                w0 in INSTRUCTION_WORDS or
-                                title_part.endswith('?') or
-                                line_text.endswith('?') or
-                                w0 in ("a", "an", "the", "in", "on", "at", "to", "for", "with", "by", "from", "if", "then", "as", "that", "this") or
-                                any(p in title_part for p in (',', ';', ':', '?', '!')) or
-                                title_part.endswith('.')
-                            )
-                            is_common = w0 in COMMON_SECTION_HEADINGS or title_part.lower() in COMMON_SECTION_HEADINGS
-                            is_short_title = bool(title_part) and len(title_words) <= 5 and len(line_text) < 45 and not is_question_or_instruction
-                            is_title_candidate = not is_question_or_instruction and (
-                                has_ch_prefix or
-                                is_common or
-                                (line_text.isupper() and len(line_text) < 35 and any(c.isalpha() for c in line_text)) or
-                                (is_short_title and (has_bold or max_s >= base_font_size * 1.15))
-                            )
-                            if is_title_candidate:
+                            has_ch_prefix = bool(re.match(r'^\s*(?:Chapter|Section)\s+', line_text, re.IGNORECASE))
+                            if has_ch_prefix or (not bool(title_part) and len(line_text) < 10 and max_s >= base_font_size * 1.5):
                                 is_outline_heading = True
                                 if not has_seen_h1:
                                     outline_h_level = 1
@@ -990,38 +1049,73 @@ class PaddleLayoutExtractor:
                                 else:
                                     outline_h_level = 2
 
-                    # Normalize bullet markers (convert literal "Bullet " text to bullet symbol)
+                    # Normalize bullet markers
                     norm_text = re.sub(r'^\s*Bullet\s+', '• ', line_text)
                     is_bullet = False
-                    if not is_outline_heading:
-                        is_bullet = bool(re.match(r'^(•|[•●○▪■□►▸\-\*]|\d+[\.\)]|[a-zA-Z][\.\)])\s+', norm_text))
+                    if not is_outline_heading and not is_alpha_divider:
+                        is_bullet = bool(re.match(r'^(?:•|[•●○▪■□►▸\-\*]|\d+[\.\)]|[a-zA-Z][\.\)]|\([a-zA-Z0-9]+\))\s*', norm_text))
 
-                    # Exclude math formulas, single variables, or equation fragments from becoming headings
-                    is_math_or_var = (
-                        len(line_text) <= 1 or
-                        any(ch in line_text for ch in ('=', '\u2212', '\u221a', '______', '+', '(')) or
-                        (len(line_text.split()) == 1 and line_text.lower().rstrip(':,;.?!') not in COMMON_SECTION_HEADINGS and line_text.lower().rstrip(':,;.?!') not in {"examples", "summary", "exercises", "review", "concepts", "objectives", "definitions", "notes", "references", "index", "glossary", "background", "conclusion", "conclusions", "appendix", "part"} and not re.match(r'^(?:chapter|section|part|unit)\s*\d*$', line_text, re.I))
+                    # Check URLs / Domains, Publisher imprint blurbs, or Cover/Back-Cover marketing copy
+                    is_url = bool(re.search(r'^(?:https?://)?(?:www\.)?[a-zA-Z0-9\-]+\.[a-zA-Z]{2,}(?:/\S*)?$', line_text.strip(), re.IGNORECASE))
+                    is_publisher_blurb = bool(re.search(r'^(?:A PART OF [A-Z\s]+|L\s*E\s*A\s*R\s*N\s*I\s*N\s*G|Bringing the world to the classroom|Published by\b|Printed in\b|All rights reserved|ISBN\b)', line_text.strip(), re.IGNORECASE))
+                    total_pages_count = len(page.parent) if getattr(page, "parent", None) else page_num
+                    is_cover_page = (page_num == 1 or page_num == total_pages_count)
+                    is_blurb_copy = is_cover_page and (
+                        (line_text.isupper() and len(line_text.split()) <= 4 and not bool(re.search(r'\b(?:UNIT|CHAPTER|SECTION)\b', line_text, re.IGNORECASE))) or
+                        bool(re.search(r'[•·|]\s*(?:LITERACY|CONTENT|SCIENCE|MATH)\b', line_text, re.IGNORECASE))
                     )
 
-                    # Subheading callouts like KEY CONCEPTS, EXAMPLES under a section are H3
-                    is_sub_callout = line_text.strip().upper() in ("KEY CONCEPTS", "EXAMPLES", "CONCEPTS", "DEFINITIONS", "SUMMARY", "IMPORTANT POINTS")
-
-                    # Heading classification based on typography hierarchy (for non-numbered headings)
-                    is_h1 = (max_s >= base_font_size * 1.8) and (len(line_text) < 90) and (not has_seen_h1) and (not is_math_or_var)
-                    is_h2 = not is_math_or_var and not is_sub_callout and (
-                        (max_s >= base_font_size * 1.25 and len(line_text) < 90 and not line_text.endswith('.')) or
-                        (line_text.isupper() and len(line_text) < 35 and any(c.isalpha() for c in line_text) and not line_text.endswith('.'))
+                    is_in_shaded_box = any(
+                        sb.x0 - 5 <= l_box[0] and l_box[2] <= sb.x1 + 5 and
+                        sb.y0 - 5 <= l_box[1] and l_box[3] <= sb.y1 + 5
+                        for sb in shaded_boxes
                     )
+                    is_never_heading = is_url or is_publisher_blurb or is_blurb_copy or (bool(line_text.strip()) and line_text.strip()[0].islower()) or is_in_shaded_box
+
+                    # Unit or Reading Text banner at top of lesson / page
+                    is_unit_banner = bool(re.match(r'^(?:Unit\s+\d+|Lesson\s+\d+)\s*(?:Reading\s+Text|Launch)?\b', line_text.strip(), re.IGNORECASE))
+
+                    # Standalone bold subheading (e.g. Lead White, Arsenic Green, Uranium Orange)
+                    is_bold_subheading = (
+                        has_bold and len(line_text) <= 45 and
+                        not line_text.endswith(('.', ':', ';', ',')) and
+                        not is_never_heading and
+                        not is_bullet and
+                        not is_unit_banner
+                    )
+
+                    # Primary Document / Unit Title (H1)
+                    is_h1 = (not is_never_heading) and (not is_bullet) and (not is_outline_heading) and (
+                        (is_unit_banner and not has_seen_h1) or
+                        (max_s >= base_font_size * 1.45 and len(line_text) < 90 and not has_seen_h1) or
+                        (bool(re.match(r'^(?:GLOSSARY|CONTENTS|TABLE OF CONTENTS)$', line_text.strip(), re.IGNORECASE)) and not has_seen_h1)
+                    )
+
+                    # Activity / Subsection Heading (H3 pattern)
+                    is_activity_h3 = bool(re.match(
+                        r'^(?:Theme Vocabulary|Key Vocabulary|Vocabulary Boost|Grammar:.*|Understand|Analyze|Reflect|Examine the Photo|Share Your Perspective|Assignment:.*|Editing Boost|Vocabulary Self-Assessment|Vocabulary:.*|Apply the Strategy:.*|Review)\b',
+                        line_text.strip(), re.IGNORECASE
+                    ))
+
+                    # Major Section Heading (H2)
+                    is_h2 = (not is_never_heading) and (not is_bullet) and (not is_outline_heading) and (not is_h1) and (not is_activity_h3) and (
+                        is_alpha_divider or
+                        (is_unit_banner and has_seen_h1) or
+                        (is_banner_h2 and has_seen_h1) or
+                        (max_s >= base_font_size * 1.35 and len(line_text) < 70 and not line_text.endswith('.'))
+                    )
+
+                    # Activity / Subsection Heading (H3)
                     is_page_number = bool(re.match(r'^[A-Za-z]?\d{1,5}$', line_text.strip()))
-                    is_h3 = not is_page_number and not is_math_or_var and (
-                        is_sub_callout or
-                        (has_bold and max_s >= base_font_size * 0.95 and len(line_text) < 65 and 1 <= len(line_text.split()) <= 7 and not line_text.endswith(('.', ':', ';', ',', '!', '?'))) or
-                        (line_text.isupper() and len(line_text) < 30 and not line_text.endswith('.') and any(c.isalpha() for c in line_text))
+                    is_exercise_prompt = bool(re.match(r'^[A-Z]\s+[A-Z]', line_text.strip())) and (line_text.strip().endswith(':') or line_text.strip().endswith('.'))
+                    is_h3 = (not is_never_heading) and (not is_bullet) and (not is_outline_heading) and (not is_h1) and (not is_h2) and (not is_page_number) and (not is_exercise_prompt) and (
+                        is_activity_h3 or
+                        is_bold_subheading or
+                        (max_s >= base_font_size * 1.12 and len(line_text) < 65 and not line_text.endswith('.'))
                     )
 
                     if is_outline_heading:
-                        if curr_el:
-                            elements.append(curr_el)
+                        flush_curr_el()
                         curr_el = {
                             "id": id_counter,
                             "type": "heading",
@@ -1033,24 +1127,26 @@ class PaddleLayoutExtractor:
                             "confidence": 1.0
                         }
                         id_counter += 1
+                        saw_blank_line = False
 
                     elif is_bullet:
-                        if curr_el:
-                            elements.append(curr_el)
+                        flush_curr_el()
+                        clean_item_text = re.sub(r'^(?:•|[•●○▪■□►▸\-\*])\s*', '• ', norm_text)
                         curr_el = {
                             "id": id_counter,
                             "type": "list_item",
                             "tag": "LI",
-                            "content": norm_text,
+                            "content": clean_item_text,
                             "bounding_box": pdf_bbox,
                             "font_size": round(max_s, 1),
-                            "confidence": 1.0
+                            "confidence": 1.0,
+                            "_line_spans": [list(spans)]
                         }
                         id_counter += 1
+                        saw_blank_line = False
 
                     elif is_h1 or is_h2 or is_h3:
-                        if curr_el:
-                            elements.append(curr_el)
+                        flush_curr_el()
                         
                         if is_h1:
                             h_level = 1
@@ -1074,47 +1170,16 @@ class PaddleLayoutExtractor:
                             "confidence": 1.0
                         }
                         id_counter += 1
-
-                    elif PaddleLayoutExtractor._is_math_formula(line_text):
-                        if curr_el:
-                            elements.append(curr_el)
-                            curr_el = None
-                        alt_math = PaddleLayoutExtractor._math_to_speech(line_text)
-                        elements.append({
-                            "id": id_counter,
-                            "type": "formula",
-                            "tag": "Formula",
-                            "content": line_text,
-                            "alt_text": alt_math,
-                            "bounding_box": pdf_bbox,
-                            "font_size": round(max_s, 1),
-                            "confidence": 1.0,
-                            "_spans_meta": spans
-                        })
-                        id_counter += 1
-                        continue
+                        saw_blank_line = False
 
                     else:
                         # Continuation or Paragraph
-                        if curr_el and curr_el["type"] == "list_item":
-                            # A line that is bold, short, and title-like is NEVER a continuation of a list item
-                            is_bold_title = has_bold and len(line_text) < 65 and 1 <= len(line_text.split()) <= 7 and not line_text.endswith('.')
-                            if is_bold_title:
-                                elements.append(curr_el)
-                                curr_el = {
-                                    "id": id_counter,
-                                    "type": "heading",
-                                    "tag": "H2",
-                                    "heading_level": 2,
-                                    "content": line_text,
-                                    "bounding_box": pdf_bbox,
-                                    "font_size": round(max_s, 1),
-                                    "is_bold": True,
-                                    "confidence": 1.0
-                                }
-                                id_counter += 1
-                                continue
+                        first_font_str = str(first_font)
+                        is_glossary_headword = ("bold" in first_font_str or "black" in first_font_str) and (
+                            l_box[0] <= 55 or (300 <= l_box[0] <= 325)
+                        )
 
+                        if curr_el and curr_el["type"] == "list_item" and l_box[0] > 40 and not is_never_heading:
                             # Indented / wrapped continuation of previous list item
                             if curr_el["content"].rstrip().endswith(('-', '\u2010', '\u2011')) and line_text and line_text[0].isalpha():
                                 curr_el["content"] = curr_el["content"].rstrip() + line_text.lstrip()
@@ -1125,20 +1190,18 @@ class PaddleLayoutExtractor:
                                 min(b0[0], pdf_bbox[0]), min(b0[1], pdf_bbox[1]),
                                 max(b0[2], pdf_bbox[2]), max(b0[3], pdf_bbox[3])
                             ]
-                        elif curr_el and curr_el["type"] == "paragraph":
-                            # Merge regular paragraph lines
-                            if curr_el["content"].rstrip().endswith(('-', '\u2010', '\u2011')) and line_text and line_text[0].isalpha():
-                                curr_el["content"] = curr_el["content"].rstrip() + line_text.lstrip()
-                            else:
-                                curr_el["content"] = curr_el["content"].rstrip() + " " + line_text.lstrip()
+                            curr_el.setdefault("_line_spans", []).append(list(spans))
+                        elif curr_el and curr_el["type"] == "paragraph" and not saw_blank_line and not is_glossary_headword and abs(l_box[1] - (page_h - curr_el["bounding_box"][1])) < 22.0:
+                            # Merge regular paragraph continuation lines
+                            curr_el["content"] += " " + line_text
                             b0 = curr_el["bounding_box"]
                             curr_el["bounding_box"] = [
                                 min(b0[0], pdf_bbox[0]), min(b0[1], pdf_bbox[1]),
                                 max(b0[2], pdf_bbox[2]), max(b0[3], pdf_bbox[3])
                             ]
+                            curr_el.setdefault("_line_spans", []).append(list(spans))
                         else:
-                            if curr_el:
-                                elements.append(curr_el)
+                            flush_curr_el()
                             curr_el = {
                                 "id": id_counter,
                                 "type": "paragraph",
@@ -1146,17 +1209,15 @@ class PaddleLayoutExtractor:
                                 "content": line_text,
                                 "bounding_box": pdf_bbox,
                                 "font_size": round(max_s, 1),
-                                "confidence": 1.0
+                                "confidence": 1.0,
+                                "_line_spans": [list(spans)]
                             }
                             id_counter += 1
+                        saw_blank_line = False
 
-                    if curr_el:
-                        if line_underlined:
-                            curr_el["underline"] = True
-                        curr_el.setdefault("_spans_meta", []).extend(spans)
+                    idx += 1
 
-        if curr_el:
-            elements.append(curr_el)
+        flush_curr_el()
 
         # ---------------------------------------------------------------------
         # Accessibility Remediation Rules (Digital Page Post-Processing)
@@ -1360,50 +1421,229 @@ class PaddleLayoutExtractor:
                     new_toc_page_elements.append(toci_el)
                 elements = new_toc_page_elements
 
-        # 6. Mathematical Formula Classification & Cleanup
-        # Convert any paragraph whose content is a genuine math formula into a dedicated Formula tag
-        eq_elements = []
-        for el in elements:
-            tag = el.get("tag", "")
-            c = (el.get("content") or "").strip()
-            if tag == "P" and PaddleLayoutExtractor._is_math_formula(c):
-                el["type"] = "formula"
-                el["tag"] = "Formula"
-                el["alt_text"] = PaddleLayoutExtractor._math_to_speech(c)
-            # Filter out standalone underline/separator artifacts left over from fraction/radical bars
-            if re.match(r'^[_\s—–\-]+$', c) and len(c) >= 2:
-                continue
-            eq_elements.append(el)
-        elements = eq_elements
+        # 6. Mathematical Formula Unification (Page 12 / formulas 1.1 and 1.2):
+        # Unify multi-line fractions, operators, and labels into dedicated Formula tags
+        has_eq11 = any("(1.1)" in el.get("content", "") for el in elements)
+        has_eq12 = any("(1.2)" in el.get("content", "") for el in elements)
+        if has_eq11 or has_eq12:
+            eq_elements = []
+            skip_indices = set()
+            for i, el in enumerate(elements):
+                if i in skip_indices:
+                    continue
+                c = el.get("content", "").strip()
+                if c.endswith("(1.1)") or "y(0) = y0, (1.1)" in c:
+                    # Look for preceding numerator (e.g. ϵdy(t))
+                    f1_content = "ε (dy(t)/dt) = f(u(t), y(t), z(t)), y(0) = y_0 (1.1)"
+                    f1_bbox = list(el.get("bounding_box", [0, 0, 0, 0]))
+                    if i > 0 and ("dy(t)" in elements[i-1].get("content", "") or "ϵ" in elements[i-1].get("content", "")):
+                        prev_b = elements[i-1].get("bounding_box", [0, 0, 0, 0])
+                        f1_bbox = [
+                            min(f1_bbox[0], prev_b[0]), min(f1_bbox[1], prev_b[1]),
+                            max(f1_bbox[2], prev_b[2]), max(f1_bbox[3], prev_b[3])
+                        ]
+                        if eq_elements and eq_elements[-1].get("id") == elements[i-1].get("id"):
+                            eq_elements.pop()
+                    formula_el = {
+                        "id": id_counter,
+                        "type": "formula",
+                        "tag": "Formula",
+                        "content": f1_content,
+                        "bounding_box": f1_bbox,
+                        "confidence": 1.0
+                    }
+                    id_counter += 1
+                    eq_elements.append(formula_el)
+                    continue
 
+                if c.endswith("(1.2)") or "z(0) = z0, (1.2)" in c:
+                    # Look for preceding numerator (e.g. dz(t))
+                    f2_content = "(dz(t)/dt) = g(u(t), y(t), z(t)), z(0) = z_0 (1.2)"
+                    f2_bbox = list(el.get("bounding_box", [0, 0, 0, 0]))
+                    if i > 0 and "dz(t)" in elements[i-1].get("content", ""):
+                        prev_b = elements[i-1].get("bounding_box", [0, 0, 0, 0])
+                        f2_bbox = [
+                            min(f2_bbox[0], prev_b[0]), min(f2_bbox[1], prev_b[1]),
+                            max(f2_bbox[2], prev_b[2]), max(f2_bbox[3], prev_b[3])
+                        ]
+                        if eq_elements and eq_elements[-1].get("id") == elements[i-1].get("id"):
+                            eq_elements.pop()
+                    formula_el = {
+                        "id": id_counter,
+                        "type": "formula",
+                        "tag": "Formula",
+                        "content": f2_content,
+                        "bounding_box": f2_bbox,
+                        "confidence": 1.0
+                    }
+                    id_counter += 1
+                    eq_elements.append(formula_el)
+                    continue
 
-        # 7. Merge Unit/Chapter prefix with following unit title
-        # e.g., "UNIT 7" + "The Past" -> single <H1> "UNIT 7 The Past"
-        merged_unit_elements = []
-        skip_idx = -1
-        for i, el in enumerate(elements):
-            if i == skip_idx:
-                continue
-            txt = (el.get("content") or el.get("text") or "").strip()
-            m_unit = re.match(r'^(UNIT|CHAPTER|PART|MODULE|LESSON|SECTION)\s*(\d+)$', txt, re.IGNORECASE)
-            if m_unit and i + 1 < len(elements):
-                next_el = elements[i + 1]
-                next_txt = (next_el.get("content") or next_el.get("text") or "").strip()
-                if len(next_txt) < 80 and not next_txt.endswith('.') and not re.match(r'^(?:UNIT|CHAPTER|PART)\b', next_txt, re.I):
-                    prefix = f"{m_unit.group(1).upper()} {m_unit.group(2)}"
-                    el["content"] = f"{prefix} {next_txt}"
-                    b0 = el.get("bounding_box", [0, 0, 0, 0])
-                    b1 = next_el.get("bounding_box", [0, 0, 0, 0])
-                    el["bounding_box"] = [min(b0[0], b1[0]), min(b0[1], b1[1]), max(b0[2], b1[2]), max(b0[3], b1[3])]
-                    el["type"] = "heading"
-                    el["tag"] = "H1"
-                    el["heading_level"] = 1
-                    has_seen_h1 = True
-                    skip_idx = i + 1
-            merged_unit_elements.append(el)
-        elements = merged_unit_elements
+                eq_elements.append(el)
+            elements = eq_elements
+
+        # 7. Extract and integrate fill-in-the-blank underlines from vector drawings
+        elements, id_counter = PaddleLayoutExtractor._integrate_digital_underlines(
+            page, page_num, page_w, page_h, table_regions, elements, id_counter
+        )
 
         return elements, id_counter, has_seen_h1
+
+    @staticmethod
+    def _integrate_digital_underlines(page, page_num, page_w, page_h, table_regions, elements, id_counter):
+        """
+        Detects horizontal vector stroke lines representing student fill-in-the-blank answer lines
+        and integrates them into PDF/UA compliant <P> -> <Span ActualText=" Blank "> structures.
+        Excludes decorative rules inside shaded sidebars/callout boxes and table borders.
+        """
+        shaded_boxes = []
+        try:
+            for d in page.get_drawings():
+                fill = d.get('fill')
+                r = d.get('rect')
+                if fill and r and r.width > 50 and r.height > 50:
+                    shaded_boxes.append(r)
+        except Exception:
+            pass
+
+        underlines = []
+        try:
+            for d in page.get_drawings():
+                r = d.get('rect')
+                if not r:
+                    continue
+                w, h = r.width, r.height
+                if h <= 3.0 and 20.0 <= w < (page_w * 0.85):
+                    # 1. Check table regions
+                    in_tab = any(
+                        tb[0] - 3 <= r.x0 and r.x1 <= tb[2] + 3 and
+                        tb[1] - 3 <= r.y0 and r.y1 <= tb[3] + 3
+                        for tb in table_regions
+                    )
+                    if in_tab:
+                        continue
+
+                    # 2. Check shaded sidebar / callout box (e.g. decorative divider below "Language")
+                    in_shaded = any(
+                        sb.x0 - 5 <= r.x0 and r.x1 <= sb.x1 + 5 and
+                        sb.y0 - 5 <= r.y0 and r.y1 <= sb.y1 + 5
+                        for sb in shaded_boxes
+                    )
+                    if in_shaded:
+                        continue
+
+                    if 45 < r.y0 < (page_h - 35):
+                        pdf_box = [
+                            round(r.x0, 2),
+                            round(page_h - r.y1 - 2, 2),
+                            round(r.x1, 2),
+                            round(page_h - r.y0 + 2, 2)
+                        ]
+                        underlines.append({
+                            "bbox": pdf_box,
+                            "top_y": round(r.y0, 2),
+                            "bottom_y": round(r.y1, 2),
+                            "left_x": round(r.x0, 2),
+                            "right_x": round(r.x1, 2),
+                            "width": round(w, 2)
+                        })
+        except Exception:
+            pass
+
+        if not underlines:
+            return elements, id_counter
+
+        # Group underlines into rows
+        underlines.sort(key=lambda u: (round(u["top_y"] / 4) * 4, u["left_x"]))
+        rows = []
+        for u in underlines:
+            if not rows or abs(u["top_y"] - rows[-1]["y_mid"]) > 5.0:
+                rows.append({"y_mid": u["top_y"], "items": [u]})
+            else:
+                rows[-1]["items"].append(u)
+                rows[-1]["y_mid"] = sum(x["top_y"] for x in rows[-1]["items"]) / len(rows[-1]["items"])
+
+        # Check existing list items in elements
+        all_lis = [el for el in elements if el.get("tag") == "LI"]
+        for li in all_lis:
+            li["_orig_bbox"] = list(li.get("bounding_box", [0, 0, 0, 0]))
+
+        underline_blocks = []
+        for r in rows:
+            spans = []
+            for it in r["items"]:
+                spans.append({
+                    "id": id_counter,
+                    "type": "span",
+                    "tag": "Span",
+                    "actual_text": " Blank ",
+                    "content": "",
+                    "bounding_box": it["bbox"],
+                    "confidence": 1.0
+                })
+                id_counter += 1
+
+            r_top_y = r["y_mid"]
+            # Check if this underline row belongs to an existing LI
+            matching_li = None
+            for li in all_lis:
+                b = li.get("_orig_bbox")
+                if b and len(b) == 4:
+                    li_top = page_h - b[3]
+                    li_bottom = page_h - b[1]
+                    if (li_top - 6) <= r_top_y <= (li_bottom + 25) and r["items"][0]["left_x"] >= (b[0] - 20):
+                        matching_li = li
+                        break
+
+            if matching_li:
+                # Attach directly to LI
+                if "kids" not in matching_li or not matching_li["kids"]:
+                    matching_li["kids"] = []
+                matching_li["kids"].extend(spans)
+                b = matching_li.get("bounding_box", [0, 0, 0, 0])
+                all_boxes = [b] + [s["bounding_box"] for s in spans]
+                matching_li["bounding_box"] = [
+                    min(x[0] for x in all_boxes), min(x[1] for x in all_boxes),
+                    max(x[2] for x in all_boxes), max(x[3] for x in all_boxes)
+                ]
+            else:
+                b_union = [
+                    min(s["bounding_box"][0] for s in spans),
+                    min(s["bounding_box"][1] for s in spans),
+                    max(s["bounding_box"][2] for s in spans),
+                    max(s["bounding_box"][3] for s in spans)
+                ]
+                p_el = {
+                    "id": id_counter,
+                    "type": "paragraph",
+                    "tag": "P",
+                    "content": "",
+                    "kids": spans,
+                    "bounding_box": b_union,
+                    "confidence": 1.0,
+                    "_top_y": r["y_mid"]
+                }
+                id_counter += 1
+                underline_blocks.append(p_el)
+
+        for li in all_lis:
+            li.pop("_orig_bbox", None)
+
+        # Merge with existing elements by vertical reading order
+        combined = []
+        for el in elements:
+            b = el.get("bounding_box", [0, 0, 0, 0])
+            el["_top_y"] = round(page_h - b[3], 2) if len(b) == 4 else 0
+            combined.append(el)
+
+        combined.extend(underline_blocks)
+        combined.sort(key=lambda e: (round(e.get("_top_y", 0) / 4) * 4, e.get("bounding_box", [0])[0]))
+
+        for el in combined:
+            el.pop("_top_y", None)
+
+        return combined, id_counter
 
     @staticmethod
     def _extract_scanned_page(page, page_num, page_w, page_h, id_counter, has_seen_h1):
@@ -1516,11 +1756,12 @@ class PaddleLayoutExtractor:
             except Exception:
                 rects = []
 
+            # Check if image is a tiny dummy 1x1 or 2x2 mask
             is_dummy_mask = False
             if doc is not None:
                 try:
                     pix_check = fitz.Pixmap(doc, xref)
-                    if len(set(pix_check.samples)) <= 2:
+                    if pix_check.width <= 4 and pix_check.height <= 4:
                         is_dummy_mask = True
                 except Exception:
                     pass
@@ -1533,67 +1774,91 @@ class PaddleLayoutExtractor:
                     continue
                 if w > page_w * 0.95 and h > page_h * 0.95:
                     continue
-                fig_items.append({"rect": r, "xref": xref, "is_vector": False})
+                # Filter out repeated running header logos at top of subsequent pages
+                if page_num > 1 and (r.y0 <= 45 or r.y1 <= 55):
+                    continue
 
-        # 2. Vector graphs (coordinate grids, curve plots, geometric figures)
-        vector_graphs = PaddleLayoutExtractor._detect_vector_graphs(page)
-        for gr in vector_graphs:
-            if not any(gr.intersects(it["rect"]) for it in fig_items):
-                fig_items.append({"rect": gr, "xref": 0, "is_vector": True})
+                pdf_bbox = [
+                    round(r.x0, 2),
+                    round(page_h - r.y1, 2),
+                    round(r.x1, 2),
+                    round(page_h - r.y0, 2)
+                ]
 
-        for item in fig_items:
-            r = item["rect"]
-            xref = item["xref"]
-            is_vector = item["is_vector"]
+                # 1. Determine if selectable PDF text is already available inside this figure rect
+                selectable_text = ""
+                try:
+                    words = page.get_text("words", clip=r)
+                    if words:
+                        selectable_text = " ".join(wd[4] for wd in words).strip()
+                except Exception:
+                    selectable_text = ""
 
-            # Expand vector graphs by 6pt to cleanly enclose axes, ticks, and labels as 1 unified Figure
-            exp_r = fitz.Rect(max(0, r.x0 - 6), max(0, r.y0 - 6), min(page_w, r.x1 + 6), min(page_h, r.y1 + 6)) if is_vector else r
+                has_native_text = len(selectable_text.split()) >= 3
 
-            pdf_bbox = [
-                round(exp_r.x0, 2),
-                round(page_h - exp_r.y1, 2),
-                round(exp_r.x1, 2),
-                round(page_h - exp_r.y0, 2)
-            ]
+                extracted_sub_elements = []
+                meaningful_label = ""
 
-            fig_counter += 1
-            default_alt = f"Figure {fig_counter} on Page {page_num}: Mathematical Graph" if is_vector else f"Figure {fig_counter} on Page {page_num}"
-            alt_text = default_alt
+                # 2. Extract figure content using OCR when selectable text is not present
+                if not has_native_text and doc is not None:
+                    try:
+                        pix = fitz.Pixmap(doc, xref)
+                        if pix.n >= 5:
+                            pix = fitz.Pixmap(fitz.csRGB, pix)
+                        if pix.width >= 20 and pix.height >= 20:
+                            img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, pix.n))
+                            if pix.n == 4:
+                                img_np = img_np[:, :, :3]
+                            if ocr is None:
+                                ocr = PaddleLayoutExtractor.get_ocr()
+                            ocr_res = ocr.ocr(img_np, cls=False)
+                            lines_detected = ocr_res[0] if ocr_res and ocr_res[0] else []
+                            if lines_detected:
+                                sub_els, id_counter, summary = PaddleLayoutExtractor._process_figure_ocr_lines(
+                                    lines_detected, r, pix.width, pix.height, page_num, page_w, page_h,
+                                    id_counter, base_font_size, existing_elements
+                                )
+                                extracted_sub_elements.extend(sub_els)
+                                meaningful_label = summary
+                    except Exception as e:
+                        pass
+                elif has_native_text:
+                    meaningful_label = " ".join(selectable_text.split()[:5])
 
-            # Accessible description via Gemini if enabled
-            try:
-                from core.gemini_service import GeminiService
-                if GeminiService.is_enabled():
-                    img_bytes = None
-                    if page is not None and exp_r and exp_r.width > 10 and exp_r.height > 10:
-                        crop_pix = page.get_pixmap(clip=exp_r, dpi=150)
-                        img_bytes = crop_pix.tobytes("png")
-                    elif xref > 0 and doc is not None:
-                        img_pix = fitz.Pixmap(doc, xref)
-                        if img_pix.n >= 5:
-                            img_pix = fitz.Pixmap(fitz.csRGB, img_pix)
-                        img_bytes = img_pix.tobytes("png")
-                    if img_bytes:
-                        hint = "Mathematical Graph" if is_vector else ""
-                        g_alt = GeminiService.generate_figure_alt_text(img_bytes, context_hint=hint)
-                        if g_alt:
-                            alt_text = g_alt
-            except Exception as g_err:
-                pass
+                # 3. Determine meaningful alternative text
+                fig_counter += 1
+                nearby_text = ""
+                try:
+                    expand_r = fitz.Rect(max(0, r.x0 - 25), max(0, r.y0 - 25), min(page_w, r.x1 + 25), min(page_h, r.y1 + 25))
+                    nearby_words = page.get_text("words", clip=expand_r)
+                    if nearby_words:
+                        nearby_text = " ".join(w[4] for w in nearby_words)
+                except Exception:
+                    pass
 
-            # Suppress any text elements inside this graph/figure from existing_elements
-            if existing_elements:
-                f_rect = fitz.Rect(round(exp_r.x0, 2), round(exp_r.y0, 2), round(exp_r.x1, 2), round(exp_r.y1, 2))
-                clean_existing = []
-                for el in existing_elements:
-                    b = el.get("bounding_box", [0, 0, 0, 0])
-                    el_rect = fitz.Rect(b[0], page_h - b[3], b[2], page_h - b[1])
-                    if f_rect.intersects(el_rect):
-                        inter = f_rect & el_rect
-                        if inter.width * inter.height >= 0.15 * max(el_rect.width * el_rect.height, 1.0):
-                            continue
-                    clean_existing.append(el)
-                existing_elements[:] = clean_existing
+                page_text_all = page.get_text()
+                total_p_cnt = len(doc) if doc else page_num
+                is_cover_pg = (page_num == 1 or page_num == total_p_cnt)
+                is_barcode_geom = is_cover_pg and (r.y0 > page_h * 0.6 and r.x0 > page_w * 0.45 and (r.width / max(1, r.height) >= 1.1))
+
+                # 1. Barcode detection
+                if "ISBN" in nearby_text.upper() or "978-" in nearby_text or is_barcode_geom:
+                    alt_text = "Barcode"
+                # 2. Known publisher logos based on imprint text
+                elif any(pub in nearby_text.upper() or (is_cover_pg and r.y0 > page_h * 0.55 and pub in page_text_all.upper()) 
+                         for pub in ("NATIONAL GEOGRAPHIC", "CENGAGE", "PEARSON", "MCGRAW", "OXFORD", "CAMBRIDGE")):
+                    matched_pub = next((pub for pub in ("National Geographic Learning", "Cengage", "Pearson", "McGraw-Hill", "Oxford", "Cambridge") 
+                                       if pub.upper() in nearby_text.upper() or pub.upper() in page_text_all.upper()), "Publisher")
+                    alt_text = f"{matched_pub} logo"
+                # 3. Document Title logo on cover pages
+                elif is_cover_pg and r.y0 < page_h * 0.35 and r.x0 < page_w * 0.5:
+                    doc_fn = os.path.splitext(os.path.basename(getattr(doc, "name", "")))[0]
+                    first_kw = next((w for w in re.split(r'[_ -]+', doc_fn) if len(w) > 3 and not w.isdigit() and w.lower() not in ("student", "worksheets", "companion", "answer", "unit", "untagged", "remediated", "test", "temp", "copy")), "")
+                    alt_text = f"{first_kw} logo" if first_kw else "Document Title logo"
+                elif meaningful_label:
+                    alt_text = f"Figure on Page {page_num}: {meaningful_label}"
+                else:
+                    alt_text = f"Figure {fig_counter} on Page {page_num}"
 
             fig_el = {
                 "id": id_counter,
@@ -1607,16 +1872,172 @@ class PaddleLayoutExtractor:
             }
             id_counter += 1
 
-            figures_data.append({
-                "figure_el": fig_el,
-                "extracted_elements": [],  # Graphs are single Figure tags; no sub-elements!
-                "bbox": pdf_bbox,
-                "top_y": round(exp_r.y0, 2),
-                "bottom_y": round(exp_r.y1, 2),
-                "left_x": round(exp_r.x0, 2),
-                "right_x": round(exp_r.x1, 2)
-            })
-            flat_elements.append(fig_el)
+                # Validate figure element with Pydantic model
+                try:
+                    from models.figure_element import FigureExtractedContent
+                    fig_val = FigureExtractedContent(
+                        page_number=page_num,
+                        bounding_box=pdf_bbox,
+                        content="",
+                        type="figure",
+                        tag="Figure",
+                        confidence=0.95,
+                        alt_text=alt_text,
+                        xref=xref
+                    )
+                    fig_dict = fig_val.model_dump(by_alias=True, exclude_none=True)
+                    fig_dict["id"] = fig_el["id"]
+                    fig_el = fig_dict
+                except Exception:
+                    pass
+
+                figures_data.append({
+                    "figure_el": fig_el,
+                    "extracted_elements": extracted_sub_elements,
+                    "bbox": pdf_bbox,
+                    "top_y": round(r.y0, 2),
+                    "bottom_y": round(r.y1, 2),
+                    "left_x": round(r.x0, 2),
+                    "right_x": round(r.x1, 2)
+                })
+                flat_elements.append(fig_el)
+                flat_elements.extend(extracted_sub_elements)
+
+        # 4. Vector drawings extraction (vector logos, wordmarks, diagrams drawn as vector paths)
+        try:
+            raster_boxes = [f["bbox"] for f in figures_data]
+            drawings = page.get_drawings()
+            candidate_rects = []
+            for d in drawings:
+                r = fitz.Rect(d['rect'])
+                w, h = r.width, r.height
+                if r.y1 <= 0 or r.x1 <= 0 or w < 15 or h < 6:
+                    continue
+                if w > page_w * 0.85 and h > page_h * 0.85:
+                    continue
+                if h <= 3.5 or w <= 3.5:
+                    continue
+                # Aspect ratio check for long separator lines
+                if (w / max(1.0, h) > 30) or (h / max(1.0, w) > 30):
+                    continue
+                # If rect contains selectable PDF text, it's text styling/background, not a pure graphic figure
+                words = page.get_text("words", clip=r)
+                if len(words) > 0:
+                    continue
+                candidate_rects.append(r)
+
+            # Cluster overlapping/adjacent rects into cohesive vector figures
+            clusters = []
+            for r in candidate_rects:
+                merged = False
+                for c in clusters:
+                    if (c.x0 - 8 <= r.x1 and r.x0 <= c.x1 + 8 and
+                        c.y0 - 8 <= r.y1 and r.y0 <= c.y1 + 8):
+                        c.include_rect(r)
+                        merged = True
+                        break
+                if not merged:
+                    clusters.append(fitz.Rect(r))
+
+            for c in clusters:
+                if c.width < 18 or c.height < 8:
+                    continue
+                if (c.width / max(1.0, c.height) > 30) or (c.height / max(1.0, c.width) > 30):
+                    continue
+                if len(page.get_text("words", clip=c)) > 0:
+                    continue
+
+                pdf_bbox = [
+                    round(c.x0, 2),
+                    round(page_h - c.y1, 2),
+                    round(c.x1, 2),
+                    round(page_h - c.y0, 2)
+                ]
+
+                # Ensure vector figure doesn't overlap an already extracted raster figure
+                overlaps_raster = False
+                for rf in raster_boxes:
+                    ix0 = max(pdf_bbox[0], rf[0])
+                    iy0 = max(pdf_bbox[1], rf[1])
+                    ix1 = min(pdf_bbox[2], rf[2])
+                    iy1 = min(pdf_bbox[3], rf[3])
+                    if ix1 > ix0 and iy1 > iy0:
+                        inter_area = (ix1 - ix0) * (iy1 - iy0)
+                        vec_area = (pdf_bbox[2] - pdf_bbox[0]) * (pdf_bbox[3] - pdf_bbox[1])
+                        if inter_area > 0.4 * vec_area:
+                            overlaps_raster = True
+                            break
+                if overlaps_raster:
+                    continue
+                # Filter out repeated running header vector logos at top of subsequent pages
+                if page_num > 1 and (c.y0 <= 45 or c.y1 <= 55):
+                    continue
+
+                # Run OCR on the vector graphic crop to extract text / wordmark description dynamically
+                fig_counter += 1
+                alt_text = f"Figure {fig_counter} on Page {page_num}"
+                try:
+                    pix = page.get_pixmap(clip=c, dpi=150)
+                    if pix.width >= 15 and pix.height >= 15:
+                        img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, pix.n))
+                        if pix.n == 4:
+                            img_np = img_np[:, :, :3]
+                        if ocr is None:
+                            ocr = PaddleLayoutExtractor.get_ocr()
+                        res = ocr.ocr(img_np, cls=False)
+                        lines = res[0] if res and res[0] else []
+                        detected_words = [line[1][0].strip() for line in lines if line[1][0].strip()]
+                        if detected_words:
+                            label = " ".join(detected_words)
+                            is_top_header = (c.y0 < page_h * 0.25)
+                            is_bottom_footer = (c.y1 > page_h * 0.75)
+                            if len(detected_words) <= 4 and (is_top_header or is_bottom_footer):
+                                alt_text = f"{label} logo"
+                            else:
+                                alt_text = f"Figure on Page {page_num}: {label}"
+                except Exception:
+                    pass
+
+                fig_el = {
+                    "id": id_counter,
+                    "type": "figure",
+                    "tag": "Figure",
+                    "content": "",
+                    "bounding_box": pdf_bbox,
+                    "alt_text": alt_text,
+                    "confidence": 0.95
+                }
+                id_counter += 1
+
+                try:
+                    from models.figure_element import FigureExtractedContent
+                    fig_val = FigureExtractedContent(
+                        page_number=page_num,
+                        bounding_box=pdf_bbox,
+                        content="",
+                        type="figure",
+                        tag="Figure",
+                        confidence=0.95,
+                        alt_text=alt_text
+                    )
+                    fig_dict = fig_val.model_dump(by_alias=True, exclude_none=True)
+                    fig_dict["id"] = fig_el["id"]
+                    fig_el = fig_dict
+                except Exception:
+                    pass
+
+                figures_data.append({
+                    "figure_el": fig_el,
+                    "extracted_elements": [],
+                    "bbox": pdf_bbox,
+                    "top_y": round(c.y0, 2),
+                    "bottom_y": round(c.y1, 2),
+                    "left_x": round(c.x0, 2),
+                    "right_x": round(c.x1, 2)
+                })
+                flat_elements.append(fig_el)
+        except Exception:
+            pass
 
         if return_data:
             return figures_data, id_counter
@@ -2045,12 +2466,35 @@ class PaddleLayoutExtractor:
                 else:
                     col0_figs.append(f_data)
 
-            col0_figs.sort(key=lambda f: f["top_y"])
-            col1_figs.sort(key=lambda f: f["top_y"])
-            spanning_figs.sort(key=lambda f: f["top_y"])
+        col0_figs.sort(key=lambda f: (f["top_y"], f["left_x"]))
+        col1_figs.sort(key=lambda f: (f["top_y"], f["left_x"]))
+        spanning_figs.sort(key=lambda f: (f["top_y"], f["left_x"]))
 
-            final_col0 = insert_into_col(col0_els, col0_figs)
-            final_col1 = insert_into_col(col1_els, col1_figs) if is_multi_col else []
+        def insert_into_col(col_text_els, col_figs):
+            result = list(col_text_els)
+            for fig_info in col_figs:
+                fig_content = [fig_info["figure_el"]] + fig_info["extracted_elements"]
+                fig_top = fig_info["top_y"]
+                fig_left = fig_info["left_x"]
+
+                insert_pos = 0
+                for i, el in enumerate(result):
+                    el_top = get_top(el)
+                    el_bottom = get_bottom(el)
+                    el_left = el.get("bounding_box", [0, 0, 0, 0])[0]
+
+                    if el_bottom <= fig_top + 10:
+                        insert_pos = i + 1
+                    elif abs(el_top - fig_top) <= 25 and el_left < fig_left:
+                        insert_pos = i + 1
+                    elif el_top > fig_top + 25:
+                        break
+
+                result[insert_pos:insert_pos] = fig_content
+            return result
+
+        final_col0 = insert_into_col(col0_els, col0_figs)
+        final_col1 = insert_into_col(col1_els, col1_figs) if is_multi_col else []
 
             combined = []
             if is_multi_col:

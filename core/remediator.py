@@ -128,6 +128,8 @@ class TaggingService:
 
             def count_stat_elements(els):
                 for el in els:
+                    if str(el.get("type", "")).lower() == "artifact" or str(el.get("tag", "")).upper() == "ARTIFACT":
+                        continue
                     stats["elements_count"] += 1
                     t = str(el.get("type", "")).lower()
                     tg = str(el.get("tag", "")).upper()
@@ -389,6 +391,13 @@ class TaggingService:
         # 7. ParentTree & PostPass
         ParentTreeBuilder.build(pdf, struct_tree_root, all_page_struct_elems, sp_allocator)
 
+        # Build Document Bookmarks / Outlines
+        try:
+            from renderer.bookmark_builder import BookmarkBuilder
+            BookmarkBuilder.build(pdf, doc_json, list(pdf.pages))
+        except Exception as bm_err:
+            print(f"[TaggingService] Bookmark build notice: {bm_err}")
+
         try:
             from export.struct_postpass import fix_links, wrap_unreadable_labels, fix_inadmissible_content, drop_empty_text_tags
             fix_links(pdf, scanned=False)
@@ -436,6 +445,8 @@ class TaggingService:
 
         def count_stat_elements(els):
             for el in els:
+                if str(el.get("type", "")).lower() == "artifact" or str(el.get("tag", "")).upper() == "ARTIFACT":
+                    continue
                 stats["elements_count"] += 1
                 t = str(el.get("type", "")).lower()
                 tg = str(el.get("tag", "")).upper()

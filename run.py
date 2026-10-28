@@ -22,8 +22,8 @@ import datetime
 
 
 def main():
-    # Hide the blank console window on Windows
-    if os.name == 'nt':
+    # Hide the blank console window only on frozen PyInstaller bundles on Windows
+    if os.name == 'nt' and getattr(sys, 'frozen', False):
         try:
             import ctypes
             ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
